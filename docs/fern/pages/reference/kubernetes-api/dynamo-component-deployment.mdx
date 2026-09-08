@@ -74,7 +74,7 @@ These fields are shared between a standalone DCD and each entry of a DGD `spec.c
 </ParamField>
 
 <ParamField path="podTemplate" type="core/v1.PodTemplateSpec">
-  Pod template for the component's pods. New components must include a container named `main` with a non-empty `image`; the operator injects command, environment, port, probe, resource, and volume-mount defaults into that container, merging your overrides by name. Existing components created without a main image may retain that omission on unrelated updates. For DGD components whose image has no parseable semantic-version tag, set `runtimeVersionOverride`. Every other container is treated as a user-managed sidecar and receives no injected defaults — sidecars must specify their own required fields such as `image`. Replaces the ten separate per-component fields (`resources`, `envs`, `livenessProbe`, and so on) that existed in `v1alpha1`.
+  Complete Pod template shared by all roles of the component. It is mutually exclusive with `roles[*].podTemplate`. New components must include a container named `main` with a non-empty `image`; the operator injects command, environment, port, probe, resource, and volume-mount defaults into that container, merging your overrides by name. Existing components created without a main image may retain that omission on unrelated updates. For DGD components whose image has no parseable semantic-version tag, set `runtimeVersionOverride`. Every other container is treated as a user-managed sidecar and receives no injected defaults — sidecars must specify their own required fields such as `image`. Replaces the ten separate per-component fields (`resources`, `envs`, `livenessProbe`, and so on) that existed in `v1alpha1`.
 
   <a href="https://pkg.go.dev/k8s.io/api/core/v1#PodTemplateSpec" target="_blank">core/v1.PodTemplateSpec</a>
 </ParamField>
@@ -90,7 +90,7 @@ These fields are shared between a standalone DCD and each entry of a DGD `spec.c
 </Indent>
 
 <ParamField path="roles" type="[]ComponentRoleSpec">
-  Optional explicit structure of a compound component. In this release, roles are supported for multinode components and must contain exactly one `leader` and one `worker`. Omit the field to retain the implicit leader/worker layout.
+  Optional explicit structure of a compound component. In this release, roles are supported for multinode components and must contain exactly one `leader` and one `worker`. Their cardinality is fixed by `multinode.nodeCount`; `roles[*].replicas` may assert the derived values. Omit the field to retain the implicit leader/worker layout. If any role sets `podTemplate`, every role must set one and the component-level `podTemplate` must be absent.
 </ParamField>
 
 <Indent>
@@ -104,7 +104,7 @@ These fields are shared between a standalone DCD and each entry of a DGD `spec.c
     Provider configuration for the workload unit generated for this role. Available only on components embedded in a DGD; standalone DCD OpenAPI omits this field. For Grove multinode leader and worker roles, use target `PodCliqueTemplateSpec`; only `topologyConstraint` is allowed in `value`. Role overrides are not supported for inter-pod GMS components. See [ProviderOverride](dynamo-graph-deployment.mdx#provideroverride).
   </ParamField>
   <ParamField path="podTemplate" type="core/v1.PodTemplateSpec">
-    Reserved for role-specific pod configuration. No component type supports this field in this release; admission rejects it. Use the component-level `podTemplate` instead.
+    Complete Pod template for this role. It must include a container named `main` with a non-empty `image`. Role templates do not inherit from each other or from the component-level template. Supplying complete role templates transfers ownership of backend-specific Leader and Worker commands and topology arguments to the user; Dynamo skips its vLLM, SGLang, and TensorRT-LLM role-dependent launch rewrites. Common Pod and workload wiring remains operator-owned. For vLLM multiprocessing, Dynamo still injects the shared coordination port `29500`. Role templates cannot currently be combined with GMS or failover. The component remains the lifecycle, rollout, scaling, service, and status boundary.
 
     <a href="https://pkg.go.dev/k8s.io/api/core/v1#PodTemplateSpec" target="_blank">core/v1.PodTemplateSpec</a>
   </ParamField>
@@ -138,7 +138,7 @@ These fields are shared between a standalone DCD and each entry of a DGD `spec.c
 </ParamField>
 
 <ParamField path="frontendSidecar" type="string">
-  Designates a container in `podTemplate.spec.containers` as the frontend sidecar. The value must match a container `name` in that list; the operator merges its frontend-sidecar defaults (Dynamo env vars, ports, health probes) into that container the same way it merges into `main`. The validation webhook rejects values that match no container.
+  Designates a container in each selected complete Pod template as the frontend sidecar. The value must match a container `name` in the component template or every role template; the operator merges its frontend-sidecar defaults (Dynamo env vars, ports, health probes) into that container the same way it merges into `main`.
 </ParamField>
 
 <ParamField path="compilationCache" type="CompilationCacheConfig">

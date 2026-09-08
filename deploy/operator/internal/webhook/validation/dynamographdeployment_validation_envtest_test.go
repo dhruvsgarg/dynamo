@@ -1047,6 +1047,89 @@ func TestDynamoGraphDeploymentValidator_Validate(t *testing.T) {
 			}),
 		},
 		{
+			name: "complete role pod templates are admitted",
+			deployment: betaDGDForAdmission(func(dgd *nvidiacomv1beta1.DynamoGraphDeployment) {
+				setBetaExplicitMultinodeRoleTemplates(betaWorkerComponent(dgd), 4)
+			}),
+		},
+		{
+			name: "role pod templates require a 1.6 or later Planner",
+			deployment: betaDGDForAdmission(func(dgd *nvidiacomv1beta1.DynamoGraphDeployment) {
+				setBetaExplicitMultinodeRoleTemplates(betaWorkerComponent(dgd), 4)
+				addBetaPlanner(dgd, "registry.example/planner:1.5.0", "")
+			}),
+			wantWebhookErrs: []string{`spec.components[1].roles: Forbidden: role-specific PodTemplates require every planner component to use Dynamo runtime 1.6.0 or later; planner component "planner" resolves to 1.5.0`},
+		},
+		{
+			name: "role pod templates gate the Planner override and not engine runtimes",
+			deployment: betaDGDForAdmission(func(dgd *nvidiacomv1beta1.DynamoGraphDeployment) {
+				setBetaExplicitMultinodeRoleTemplates(betaWorkerComponent(dgd), 4)
+				addBetaPlanner(dgd, "registry.example/planner:1.5.0", "1.6.0")
+			}),
+		},
+		{
+			name: "role pod templates reject a Planner override below 1.6 despite its image tag",
+			deployment: betaDGDForAdmission(func(dgd *nvidiacomv1beta1.DynamoGraphDeployment) {
+				setBetaExplicitMultinodeRoleTemplates(betaWorkerComponent(dgd), 4)
+				addBetaPlanner(dgd, "registry.example/planner:1.6.0", "1.5.0")
+			}),
+			wantWebhookErrs: []string{`spec.components[1].roles: Forbidden: role-specific PodTemplates require every planner component to use Dynamo runtime 1.6.0 or later; planner component "planner" resolves to 1.5.0`},
+		},
+		{
+			name: "switching to role pod templates rejects an existing pre-1.6 Planner",
+			oldDeployment: betaDGDForAdmission(func(dgd *nvidiacomv1beta1.DynamoGraphDeployment) {
+				betaWorkerComponent(dgd).Multinode = &nvidiacomv1beta1.MultinodeSpec{NodeCount: 4}
+				addBetaPlanner(dgd, "registry.example/planner:1.5.0", "")
+			}),
+			deployment: betaDGDForAdmission(func(dgd *nvidiacomv1beta1.DynamoGraphDeployment) {
+				setBetaExplicitMultinodeRoleTemplates(betaWorkerComponent(dgd), 4)
+				addBetaPlanner(dgd, "registry.example/planner:1.5.0", "")
+			}),
+			wantWebhookErrs: []string{`spec.components[1].roles: Forbidden: role-specific PodTemplates require every planner component to use Dynamo runtime 1.6.0 or later; planner component "planner" resolves to 1.5.0`},
+		},
+		{
+			name: "switching to role pod templates can atomically upgrade the Planner",
+			oldDeployment: betaDGDForAdmission(func(dgd *nvidiacomv1beta1.DynamoGraphDeployment) {
+				betaWorkerComponent(dgd).Multinode = &nvidiacomv1beta1.MultinodeSpec{NodeCount: 4}
+				addBetaPlanner(dgd, "registry.example/planner:1.5.0", "")
+			}),
+			deployment: betaDGDForAdmission(func(dgd *nvidiacomv1beta1.DynamoGraphDeployment) {
+				setBetaExplicitMultinodeRoleTemplates(betaWorkerComponent(dgd), 4)
+				addBetaPlanner(dgd, "registry.example/planner:1.6.0", "")
+			}),
+		},
+		{
+			name: "alpha role pod templates reject a pre-1.6 Planner at the source path",
+			deployment: alphaDGDForAdmission(func(dgd *nvidiacomv1alpha1.DynamoGraphDeployment) {
+				setAlphaExplicitMultinodeRoleTemplates(dgd.Spec.Services[dgdAdmissionWorkerName], 4)
+				addAlphaPlanner(dgd, "registry.example/planner:1.5.0", "")
+			}),
+			wantWebhookErrs: []string{`spec.services[worker].roles: Forbidden: role-specific PodTemplates require every planner component to use Dynamo runtime 1.6.0 or later; planner component "planner" resolves to 1.5.0`},
+		},
+		{
+			name: "role pod template sidecars require images in CEL",
+			deployment: betaDGDForAdmission(func(dgd *nvidiacomv1beta1.DynamoGraphDeployment) {
+				worker := betaWorkerComponent(dgd)
+				setBetaExplicitMultinodeRoleTemplates(worker, 4)
+				worker.Roles[0].PodTemplate.Spec.Containers = append(
+					worker.Roles[0].PodTemplate.Spec.Containers,
+					corev1.Container{Name: "metrics"},
+				)
+			}),
+			wantCELErr: "spec.components[1].roles[0].podTemplate.spec.containers[1]: Invalid value: sidecar containers must specify a non-empty image",
+		},
+		{
+			name: "role pod template backend annotations are validated by CEL",
+			deployment: betaDGDForAdmission(func(dgd *nvidiacomv1beta1.DynamoGraphDeployment) {
+				worker := betaWorkerComponent(dgd)
+				setBetaExplicitMultinodeRoleTemplates(worker, 4)
+				worker.Roles[0].PodTemplate.Annotations = map[string]string{
+					consts.KubeAnnotationVLLMDistributedExecutorBackend: "invalid",
+				}
+			}),
+			wantCELErr: "spec.components[1].roles[0].podTemplate.metadata.annotations: Invalid value: podTemplate backend annotation must be mp or ray, case-insensitively",
+		},
+		{
 			name: "v1alpha1 explicit multinode roles convert and are admitted",
 			deployment: alphaDGDForAdmission(func(dgd *nvidiacomv1alpha1.DynamoGraphDeployment) {
 				worker := dgd.Spec.Services[dgdAdmissionWorkerName]
@@ -1056,40 +1139,6 @@ func TestDynamoGraphDeploymentValidator_Validate(t *testing.T) {
 					{Name: nvidiacomv1alpha1.ComponentRoleWorker},
 				}
 			}),
-		},
-		{
-			name: "v1beta1 role PodTemplates require component-specific support",
-			deployment: betaDGDForAdmission(func(dgd *nvidiacomv1beta1.DynamoGraphDeployment) {
-				worker := betaWorkerComponent(dgd)
-				worker.Multinode = &nvidiacomv1beta1.MultinodeSpec{NodeCount: 2}
-				worker.Roles = []nvidiacomv1beta1.ComponentRoleSpec{
-					{
-						Name: nvidiacomv1beta1.ComponentRoleLeader,
-						PodTemplate: &corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{
-							Name: consts.MainContainerName, Image: "registry.example/leader:1.1.0",
-						}}}},
-					},
-					{Name: nvidiacomv1beta1.ComponentRoleWorker},
-				}
-			}),
-			wantWebhookErrs: []string{"spec.components[1].roles[0].podTemplate: Forbidden: is not supported for this component role"},
-		},
-		{
-			name: "v1alpha1 role PodTemplates require component-specific support",
-			deployment: alphaDGDForAdmission(func(dgd *nvidiacomv1alpha1.DynamoGraphDeployment) {
-				worker := dgd.Spec.Services[dgdAdmissionWorkerName]
-				worker.Multinode = &nvidiacomv1alpha1.MultinodeSpec{NodeCount: 2}
-				worker.Roles = []nvidiacomv1alpha1.ComponentRoleSpec{
-					{
-						Name: nvidiacomv1alpha1.ComponentRoleLeader,
-						PodTemplate: &corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{
-							Name: consts.MainContainerName, Image: "registry.example/leader:1.1.0",
-						}}}},
-					},
-					{Name: nvidiacomv1alpha1.ComponentRoleWorker},
-				}
-			}),
-			wantWebhookErrs: []string{"spec.components[0].roles[0].podTemplate: Forbidden: is not supported for this component role"},
 		},
 		{
 			name: "roles require a component role schema",
@@ -3399,6 +3448,66 @@ func setBetaExplicitMultinodeRoles(
 	worker.Roles = []nvidiacomv1beta1.ComponentRoleSpec{
 		{Name: nvidiacomv1beta1.ComponentRoleLeader},
 		{Name: nvidiacomv1beta1.ComponentRoleWorker},
+	}
+}
+
+func setBetaExplicitMultinodeRoleTemplates(
+	worker *nvidiacomv1beta1.DynamoComponentDeploymentSharedSpec,
+	nodeCount int32,
+) {
+	setBetaExplicitMultinodeRoles(worker, nodeCount)
+	for i := range worker.Roles {
+		worker.Roles[i].PodTemplate = worker.PodTemplate.DeepCopy()
+	}
+	worker.PodTemplate = nil
+}
+
+func addBetaPlanner(
+	dgd *nvidiacomv1beta1.DynamoGraphDeployment,
+	image string,
+	runtimeVersionOverride string,
+) {
+	dgd.Spec.Components = append(dgd.Spec.Components, nvidiacomv1beta1.DynamoComponentDeploymentSharedSpec{
+		ComponentName:          "planner",
+		ComponentType:          nvidiacomv1beta1.ComponentTypePlanner,
+		RuntimeVersionOverride: runtimeVersionOverride,
+		Replicas:               k8sptr.To(int32(1)),
+		PodTemplate: &corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: consts.MainContainerName, Image: image}},
+		}},
+	})
+}
+
+func setAlphaExplicitMultinodeRoleTemplates(
+	worker *nvidiacomv1alpha1.DynamoComponentDeploymentSharedSpec,
+	nodeCount int32,
+) {
+	template := &corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+		Containers: []corev1.Container{{
+			Name:  consts.MainContainerName,
+			Image: worker.ExtraPodSpec.MainContainer.Image,
+		}},
+	}}
+	worker.Multinode = &nvidiacomv1alpha1.MultinodeSpec{NodeCount: nodeCount}
+	worker.Roles = []nvidiacomv1alpha1.ComponentRoleSpec{
+		{Name: nvidiacomv1alpha1.ComponentRoleLeader, PodTemplate: template.DeepCopy()},
+		{Name: nvidiacomv1alpha1.ComponentRoleWorker, PodTemplate: template.DeepCopy()},
+	}
+	worker.ExtraPodSpec = nil
+}
+
+func addAlphaPlanner(
+	dgd *nvidiacomv1alpha1.DynamoGraphDeployment,
+	image string,
+	runtimeVersionOverride string,
+) {
+	dgd.Spec.Services["planner"] = &nvidiacomv1alpha1.DynamoComponentDeploymentSharedSpec{
+		ComponentType:          consts.ComponentTypePlanner,
+		RuntimeVersionOverride: runtimeVersionOverride,
+		Replicas:               k8sptr.To(int32(1)),
+		ExtraPodSpec: &nvidiacomv1alpha1.ExtraPodSpec{
+			MainContainer: &corev1.Container{Image: image},
+		},
 	}
 }
 

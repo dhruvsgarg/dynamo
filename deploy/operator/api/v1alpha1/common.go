@@ -90,9 +90,11 @@ type ComponentRoleSpec struct {
 	// +optional
 	ProviderOverride *ProviderOverride `json:"providerOverride,omitempty"`
 
-	// PodTemplate defines the Pod configuration for this role. Admission permits
-	// it only when the enclosing component type explicitly supports role-specific
-	// Pod templates. No component type supports it in this release.
+	// PodTemplate defines the complete Pod configuration for this role. When
+	// any role supplies a PodTemplate, the component-level Pod configuration
+	// must be absent and every required Pod-producing role must supply one. The
+	// role templates own backend-specific Leader and Worker launch commands;
+	// the operator retains common Pod and workload wiring.
 	// +optional
 	PodTemplate *corev1.PodTemplateSpec `json:"podTemplate,omitempty"`
 }

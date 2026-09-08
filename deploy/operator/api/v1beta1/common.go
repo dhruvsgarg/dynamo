@@ -134,9 +134,11 @@ type ComponentRoleSpec struct {
 	// +optional
 	ProviderOverride *ProviderOverride `json:"providerOverride,omitempty"`
 
-	// podTemplate defines the Pod configuration for this role. Admission permits
-	// it only when the enclosing component type explicitly supports role-specific
-	// Pod templates. No component type supports it in this release.
+	// podTemplate defines the complete Pod configuration for this role. When
+	// any role supplies a podTemplate, the component-level podTemplate must be
+	// absent and every required Pod-producing role must supply one. The role
+	// templates own backend-specific Leader and Worker launch commands; the
+	// operator retains common Pod and workload wiring.
 	// +optional
 	PodTemplate *corev1.PodTemplateSpec `json:"podTemplate,omitempty"`
 }
@@ -318,7 +320,7 @@ type GPUMemoryServiceSpec struct {
 	// extraClientContainers lists additional user-declared containers that should
 	// be wired as GMS clients in service pods. SnapshotJob capture Pod clients are
 	// declared under checkpoint.job.gmsClientContainers. Every name must match a container
-	// in the enclosing component's podTemplate.spec.containers.
+	// in the enclosing component's podTemplate, or in every role podTemplate when those are used.
 	// +optional
 	// +listType=set
 	// +kubebuilder:validation:items:MinLength=1
@@ -806,6 +808,25 @@ type ComponentReplicaStatus struct {
 	// active revision namespace until cutover completes.
 	// +optional
 	RuntimeNamespace string `json:"runtimeNamespace,omitempty"`
+
+	// servedModelName is the effective primary model identity exposed by this
+	// component's serving role. During rolling updates, worker status keeps the
+	// old active revision value until cutover completes.
+	// +optional
+	ServedModelName string `json:"servedModelName,omitempty"`
+
+	// runtimeComponentName is an explicit Dynamo runtime component identity
+	// resolved from the serving role's endpoint override. Omission means the
+	// backend default applies. During rolling updates, worker status keeps the
+	// old active revision value until cutover completes.
+	// +optional
+	RuntimeComponentName string `json:"runtimeComponentName,omitempty"`
+
+	// gpuPowerLimitWatts is the effective per-GPU power limit propagated to the
+	// component's Pods. Omission means no power limit is configured.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	GPUPowerLimitWatts *int64 `json:"gpuPowerLimitWatts,omitempty"`
 
 	// gpusPerEngine is the number of GPUs assigned to one inference engine in a
 	// component replica, across all of its nodes. Independent auxiliary GPU

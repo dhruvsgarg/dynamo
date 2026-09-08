@@ -69,6 +69,7 @@ func (p *componentProgram) Reconcile(
 ) (programResult workloadProgramResult, retErr error) {
 	programResult = newWorkloadProgramResult(req.DGD)
 	clearComponentGPUShapes(programResult.Status.Components)
+	clearComponentRuntimeStatuses(programResult.Status.Components)
 	defer func() {
 		if retErr == nil {
 			return
