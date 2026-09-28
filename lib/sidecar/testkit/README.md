@@ -3,14 +3,14 @@ SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All 
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# Shared CPU integration-test harness for sidecars
+# Shared sidecar test framework
 
 ## Goal and scope
 
 Build a Rust-only, CPU-only testing framework for the vLLM and SGLang sidecars.
-Share test scenarios, synchronization, server lifetime management, request
-construction, and assertions wherever the sidecar contract is the same. Keep
-native protocol details in small framework adapters. Add future tests to these
+Share scenarios and assertions where the contract is common and sharing stays
+simple. Reuse synchronization, server lifetime management and request builders.
+Keep native integration details in small framework adapters. Add future tests to these
 boundaries instead of creating another independent fake server for each test.
 
 The foundation has four scenario families: streaming, failures, cancellation,
@@ -20,12 +20,14 @@ registering the foundation's vLLM cases a second time. Its refreshed conformance
 suite collected and passed nine vLLM and four retained SGLang cases.
 No new SGLang or TensorRT-LLM scenario or native-engine activation is added.
 
-The stack is [#14879](https://github.com/ai-dynamo/dynamo/pull/14879) (this
-foundation), [#15089](https://github.com/ai-dynamo/dynamo/pull/15089) (isolated
-units), then [#15091](https://github.com/ai-dynamo/dynamo/pull/15091) (additional
-vLLM wire coverage and process/native integration). The later increments reuse
-this harness; new backend coverage is vLLM-only. Existing SGLang cases and E2E
-allocation remain in place.
+The approved stack is [#14879](https://github.com/ai-dynamo/dynamo/pull/14879)
+(shared foundation), [#15243](https://github.com/ai-dynamo/dynamo/pull/15243)
+(backend-local units), then [#15091](https://github.com/ai-dynamo/dynamo/pull/15091)
+(additional vLLM wire, process and native integration). The original unit PR
+[#15089](https://github.com/ai-dynamo/dynamo/pull/15089) remains a separate
+comparison. The unit suite contains 82 cases: 11 common and 71 vLLM; SGLang units
+remain follow-up work. Existing shared integration scenarios, reusable fixtures,
+SGLang wire cases and E2E allocation remain in place.
 
 The testing strategy has two distinct execution paths. Pure unit tests call
 conversion or parsing functions directly. Tests of actual sidecar generation and
@@ -60,9 +62,9 @@ sidecar performs request conversion, connection handling, response conversion,
 cancellation, and cleanup through its normal public API.
 
 The testkit library has no direct concrete sidecar, Mocker, protobuf, or tonic dependency.
-The integration tests depend on those crates through `dev-dependencies`. No
-production sidecar or Mocker depends on the testkit. This prevents testing
-infrastructure from becoming part of their normal dependency graph.
+The integration tests depend on those crates through `dev-dependencies`. Normal
+production sidecar and Mocker builds do not depend on the testkit. vLLM unit
+fixtures live in its own crate, so it also has no testkit dev-dependency.
 
 | Location | Responsibility |
 |---|---|
@@ -75,10 +77,15 @@ infrastructure from becoming part of their normal dependency graph.
 | `tests/support/{vllm,sglang}.rs` | Start each existing Mocker service, construct its real sidecar, delegate RPCs, and interpret native messages. |
 | `tests/conformance.rs` and `tests/conformance/` | Enroll retained SGLang and extended vLLM scenarios without duplicating the four foundation vLLM cases. |
 
-Framework adapters are shared within the central integration suite. They are not
-public fixture APIs for other crates. Pure tests beside the sidecar implementation
-can use generic testkit helpers as a development dependency where useful; they do
-not need to construct a Mocker.
+Wire adapters belong to the central integration suite. Isolated units are
+ordinary `#[cfg(test)]` child modules beside their production owners, keeping
+private converters accessible. Small tests are inline; the larger transport and
+vLLM conversion modules use adjacent test files. Inputs, production calls and
+assertions live together, with no unit source-group macros or backend adapters.
+Tests use ordinary `#[test]` or `#[tokio::test]` attributes. Native builders,
+including `minimal_request()`, live in `vllm/src/test_fixtures.rs` under `#[cfg(test)]`,
+reused by vLLM units and its retained fake-server tests. Shared integration
+helpers remain in testkit; no shared unit-testing layer is introduced.
 
 ## Request controls and observations
 
@@ -143,7 +150,7 @@ contract.
 
 | Behavior | Owning layer | What to reuse or extend |
 |---|---|---|
-| Endpoint/configuration parsing and request conversion | A test module beside the implementation | Existing value builders or assertions where useful; no server. |
+| Endpoint/configuration parsing and request conversion | The owning common or backend production module | Common inputs, plain setup functions and direct production conversion; no server. |
 | Shared stream, cancellation, or lifecycle behavior | A new scenario in the central integration suite | Both existing fixtures, per-request controls, and output assertions. |
 | Native malformed responses, logprob metadata, or handoff fields | Framework-specific tests in the central suite, or pure conversion tests | Native message observation and adapter-specific response overrides; keep exact wire fields visible. |
 | Discovery, readiness, or model metadata | Framework-specific service tests | Shared server lifetime; add controlled native discovery/health handlers when their tests are introduced. |
@@ -175,37 +182,24 @@ capability mapping; [DEVIATIONS.md](DEVIATIONS.md) records changes separately
 from the read-only DEP. #15088 is superseded by the user-approved stack.
 
 ```bash
-python3 lib/sidecar/testkit/run.py --level unit --list
-python3 lib/sidecar/testkit/run.py --level pre-merge
-python3 lib/sidecar/testkit/run.py --level integration
+cargo test --locked --all-targets
+cargo build --locked -p dynamo-vllm-sidecar --bin dynamo-vllm-sidecar
+cargo test --locked -p dynamo-sidecar-testkit --features process-tests --test cross_process -- --test-threads=1
 ```
 
-`unit` selects common code once and vLLM's isolated modules. `wire` includes the
-retained SGLang foundation and Mocker coverage alongside vLLM's wire coverage.
-`process` launches actual vLLM sidecars; `integration` combines wire and process.
-`pre-merge` combines units and wire. `all` selects CPU layers; native engine
-execution requires its separate launcher. No new SGLang units/process/native
-fixtures are implied by retaining its existing wire coverage.
-
-Export and execute the same CPU selection without engines, GPU devices, model
-caches or external networking. Place the artifact directory outside the source
-checkout on the configured build storage:
-
-```bash
-python3 lib/sidecar/testkit/run.py --level integration --export "$artifacts"
-docker build -f lib/sidecar/testkit/CPU.Dockerfile -t sidecar-cpu "$artifacts"
-docker run --rm --network none sidecar-cpu --level integration
-```
+The normal workspace command runs units, shared wire scenarios and retained
+Mocker tests. Process tests require `process-tests` and a built sidecar binary;
+CI enables them after merge and nightly. Native tests require `native-tests`
+and the separate GPU launcher documented in [NATIVE.md](NATIVE.md). No new
+SGLang unit, process or native fixture is implied by its retained wire coverage.
+There is no Python unit runner, per-test Rust lane marker or extra CPU container.
 
 Use Rust 1.96.1, protoc 30.2, matching `PROTOC`/`PROTOC_INCLUDE`, and an external
-`CARGO_TARGET_DIR`. The runner collects selected cases before execution and
-rejects empty, missing or duplicate targets, failures, ignored cases and count
-mismatches. Refreshed #14879 at `286d6fd5` passed eight shared and eight retained Mocker
-cases plus Clippy. #15089 at `b3ab1638513e255828acddc40f045d069ed6bc33`
-passed 62 isolated cases in the CPU container, 102 total common/vLLM library
-cases, eight shared conformance cases and eight retained Mocker cases; formatting,
-Clippy, pre-commit and ownership checks passed. These selections overlap and
-must not be added.
+`CARGO_TARGET_DIR`. [UNITS.md](UNITS.md) records validation of #15243's ordinary
+unit tests. Each new integration head needs its own validation; the prior
+integration results below are historical and do not certify this restack.
+
+### Historical integration execution before the #15243 restack
 
 The #15091 integration candidate based on `b3ab1638` passed all 124 selected
 cases in the isolated CPU container: 62 units, 56 wire cases and six process
@@ -216,8 +210,8 @@ that collection is not another execution. All-target Clippy with both integratio
 features and formatting passed. [COVERAGE.md](COVERAGE.md) records commands and
 [PROCESS.md](PROCESS.md) records the refreshed runtime regressions. Native
 compatibility and cancellation passed; handoff reproduced its upstream blocker,
-as recorded in [NATIVE.md](NATIVE.md). Final current-head CI remains pending.
-Older CPU/native/CI results remain labeled historical.
+as recorded in [NATIVE.md](NATIVE.md). Current-head CI is separate from this historical run.
+These CPU/native/CI results retain their original revision attribution.
 
 Default CPU unit/wire coverage remains pre-merge. New process/native CI follows
 the post-merge/nightly allocation; existing E2E allocation is preserved.

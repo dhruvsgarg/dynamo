@@ -4,21 +4,22 @@
 # vLLM process and handoff integration
 
 [#15091](https://github.com/ai-dynamo/dynamo/pull/15091) adds process/handoff
-integration after #14879's shared foundation and #15089's isolated units, on
+integration after #14879's shared foundation and #15243's local units, on
 refreshed main `4a0547f8ba2675f14d50e48d6aec53b1bc3cf3e3`. vLLM 0.29.0 and native
-protocol 0.3.0 remain pinned. The integration candidate based on #15089
+protocol 0.3.0 remain pinned. The historical integration candidate based on #15089
 `b3ab1638513e255828acddc40f045d069ed6bc33` collected and passed all six process
-cases in the isolated CPU container, with zero ignored. Fresh runtime results
-are recorded below; historical results keep their old revision attribution.
+cases in the isolated CPU container, with zero ignored. Those results and the
+runtime results below predate this restack and keep their original attribution.
 Final current-head CI remains pending.
 
 CPU results do not establish real-engine compatibility, GPU work release or KV
 transfer. [NATIVE.md](NATIVE.md) retains historical cancellation/compatibility
 passes and the unresolved pinned-engine handoff blocker.
 
-The preceding #15089 boundary at `b3ab1638` passed its isolated unit, full
-common/vLLM library and retained foundation/Mocker suites, as recorded in
-[UNITS.md](UNITS.md). Those results do not execute this integration layer.
+The #15243 unit boundary at `40c329fe2b` passed its common/vLLM tests, as
+recorded in [UNITS.md](UNITS.md). Those results do not execute this integration
+layer. Process tests still require the `process-tests` feature and run after
+merge and nightly; they introduce no per-test Rust lane markers.
 
 ## Production boundaries
 
@@ -107,7 +108,11 @@ Set `DYNAMO_VLLM_SIDECAR` to an absolute executable path when using separate
 build directories. Use the same `CARGO_TARGET_DIR` and protobuf compiler for
 building the binary and tests.
 
-## Refreshed candidate execution
+The current restack's six process cases passed with the rebuilt sidecar in
+22.42 seconds; [COVERAGE.md](COVERAGE.md#local-validation-of-the-15243-restack)
+records that candidate and the accompanying checks.
+
+## Historical candidate execution before the #15243 restack
 
 These results belong to the #15091 candidate based on `b3ab1638`, with refreshed
 main `4a0547f8` and its updated shared dependencies. They do not identify a final

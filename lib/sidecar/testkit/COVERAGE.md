@@ -4,11 +4,12 @@
 # Coverage and execution ledger
 
 The five DEP tabs remain read-only. The user-approved stack is #14879
-(DIS-2941: shared vLLM/SGLang CPU foundation), #15089 (DIS-2942: common/vLLM
-isolated units), then #15091 (DIS-2943: additional vLLM wire, process and native
-integration). #15088 is superseded. The foundation is refreshed onto main
+(DIS-2941: shared vLLM/SGLang CPU foundation), #15243 (DIS-2942: common/vLLM
+units beside production), then #15091 (DIS-2943: additional vLLM wire, process
+and native integration). #15089 remains a separate unit-layout comparison;
+#15088 is superseded. The foundation is based on main
 `4a0547f8ba2675f14d50e48d6aec53b1bc3cf3e3`; vLLM 0.29.0 and protocol 0.3.0 remain pinned.
-Updated shared Rust dependencies require validation of each new head.
+Each integration head requires its own validation.
 
 ## Retained foundation and isolated units
 
@@ -18,13 +19,20 @@ submission/during opening/during read with independent-request survival; and
 cleanup. #15091's nine vLLM wire scenarios incorporate those four vLLM families,
 not an additional duplicate enrollment. Its four SGLang foundation cases remain.
 
-#15089 owns the full R01–R32 mapping and pure assertion relocations in
+#15243 owns the full R01–R32 mapping and pure assertion relocations in
 [UNITS.md](UNITS.md). Shared production units run once; new backend units are
 vLLM-only. The no-I/O before-start/idempotent-cleanup subsection moves only for
 vLLM; SGLang retains its original subsection. Both backends retain active-stream
 cleanup, cancelled terminal/usage and remote release at the wire boundary.
 
-Both Mocker suites retain all four cases through #15089. At the integration
+The isolated suite contains 82 cases: 11 common and 71 vLLM, using ordinary
+`#[test]` and `#[tokio::test]` attributes. They run with the normal workspace
+command and nightly Rust coverage. There is no unit lane macro or shared unit
+adapter. Native fixtures live in the vLLM crate, without a testkit
+dev-dependency. #15243 retains 37 broader vLLM library cases; this integration
+boundary consolidates three wire cases into conformance, leaving 34 there.
+
+Both Mocker suites retain all four cases through #15243. At the integration
 boundary, the two distinct vLLM manual-handoff/KV-relay cases and all four SGLang
 Mocker cases remain. SGLang's incremental logprobs/usage, prefill/decode,
 Abort release, request isolation and shutdown assertions are not replaced by
@@ -34,21 +42,20 @@ vLLM tests. Existing TensorRT-LLM, shared-production and E2E ownership remains.
 
 The following maps all distinct assertions from the prior wire increment to
 its new integration owner. All nine cases were collected and passed in the
-refreshed integration candidate's CPU container, with zero ignored. The source
-is based on #15089 `b3ab1638`; no final integration commit is attributed here.
-Older vLLM results remain separately labeled as historical.
+historical integration candidate based on #15089 `b3ab1638`, with zero ignored.
+That execution predates this restack onto #15243 and does not validate its new head.
 
 | DEP IDs / prior assertions | Owning boundary and new case | Disposition / execution |
 | --- | --- | --- |
-| R09/C4; old `sidecar_streams_mocker_tokens_logprobs_and_usage` | CPU wire `streaming::vllm_tokens_terminal_logprobs_and_usage` | Adds full native token/text/selected and alternative logprob values, prompt logprob values, exact terminal and all usage fields, nondefault request fields, and ignored post-terminal replay. Historical vLLM run passed; refreshed #15091 candidate also collected and passed, 0 ignored. |
-| R11/C6/C7 | CPU wire `errors::vllm_open_failure_early_eof_and_read_failure` | Typed open/read Unavailable, early EOF Unknown, exact emitted prefix, no false success, remote drop, subsequent healthy request on same engine. Historical vLLM run passed; refreshed #15091 candidate also collected and passed, 0 ignored. |
-| C6 native rejection; old `grpc_request_errors_are_propagated` | CPU wire `errors::vllm_native_rejection_recovers_on_same_engine` | Real Mocker admission rejects oversized output before a response stream opens; InvalidArgument and exact native reason survive; following request succeeds. Historical vLLM run passed; refreshed #15091 candidate also collected and passed, 0 ignored. |
-| C7 malformed native terminal | CPU wire `errors::vllm_malformed_terminal_fails_then_recovers` | Scripted token then invalid native enum; exact prefix, protocol Unknown, no successful completion, recovery. Historical vLLM run passed; refreshed #15091 candidate also collected and passed, 0 ignored. |
-| R12/R14/C8; old `cancellation_interrupts_pending_response_headers`, `cancellation_drops_the_remote_stream` | CPU wire `cancellation::vllm_cancellation_before_open_during_open_and_during_read` | Before-open no submission, held headers drop, independently paused concurrent streams on a two-connection pool; cancellation A leaves B pending and B completes; same-engine healthy follow-up. Historical vLLM run passed; refreshed #15091 candidate also collected and passed, 0 ignored. |
-| C8; old `dropping_sidecar_stream_cancels_mocker_work` (actually explicit stop) | CPU wire `cancellation::vllm_explicit_cancel_releases_active_scheduler_work` | Observe nonterminal output and active scheduler first; exactly cancelled terminal with partial usage, route release and zero running/waiting scheduler work, healthy follow-up. Historical vLLM run passed; refreshed #15091 candidate also collected and passed, 0 ignored. |
-| C9 | CPU wire `cancellation::vllm_consumer_drop_releases_active_scheduler_work` | Drop live consumer without stop or Abort; observe active scheduler first, then remote drop and zero running/waiting scheduler work, healthy follow-up. Historical vLLM run passed; refreshed #15091 candidate also collected and passed, 0 ignored. |
-| R13 direct cleanup | CPU wire `lifecycle::vllm_cleanup_during_read_and_post_cleanup_admission` | Live-stream cancellation and post-cleanup generation cannot submit native work; #15089 moves only vLLM before-start error and repeatable cleanup into isolated coverage; SGLang retains its foundation checks. Historical vLLM run passed; refreshed #15091 candidate also collected and passed, 0 ignored. |
-| C7 peer termination; framework bounded teardown | CPU wire `lifecycle::vllm_teardown_terminates_handlers_with_clients_alive` | Abruptly terminate dedicated native server runtime while real engine and stream objects remain alive; join runtime, observe handler and scheduler release, exact prefix plus typed failure. Historical vLLM run passed; refreshed #15091 candidate also collected and passed, 0 ignored. |
+| R09/C4; old `sidecar_streams_mocker_tokens_logprobs_and_usage` | CPU wire `streaming::vllm_tokens_terminal_logprobs_and_usage` | Adds full native token/text/selected and alternative logprob values, prompt logprob values, exact terminal and all usage fields, nondefault request fields, and ignored post-terminal replay. Historical vLLM run passed; earlier #15091 candidate also collected and passed, 0 ignored. |
+| R11/C6/C7 | CPU wire `errors::vllm_open_failure_early_eof_and_read_failure` | Typed open/read Unavailable, early EOF Unknown, exact emitted prefix, no false success, remote drop, subsequent healthy request on same engine. Historical vLLM run passed; earlier #15091 candidate also collected and passed, 0 ignored. |
+| C6 native rejection; old `grpc_request_errors_are_propagated` | CPU wire `errors::vllm_native_rejection_recovers_on_same_engine` | Real Mocker admission rejects oversized output before a response stream opens; InvalidArgument and exact native reason survive; following request succeeds. Historical vLLM run passed; earlier #15091 candidate also collected and passed, 0 ignored. |
+| C7 malformed native terminal | CPU wire `errors::vllm_malformed_terminal_fails_then_recovers` | Scripted token then invalid native enum; exact prefix, protocol Unknown, no successful completion, recovery. Historical vLLM run passed; earlier #15091 candidate also collected and passed, 0 ignored. |
+| R12/R14/C8; old `cancellation_interrupts_pending_response_headers`, `cancellation_drops_the_remote_stream` | CPU wire `cancellation::vllm_cancellation_before_open_during_open_and_during_read` | Before-open no submission, held headers drop, independently paused concurrent streams on a two-connection pool; cancellation A leaves B pending and B completes; same-engine healthy follow-up. Historical vLLM run passed; earlier #15091 candidate also collected and passed, 0 ignored. |
+| C8; old `dropping_sidecar_stream_cancels_mocker_work` (actually explicit stop) | CPU wire `cancellation::vllm_explicit_cancel_releases_active_scheduler_work` | Observe nonterminal output and active scheduler first; exactly cancelled terminal with partial usage, route release and zero running/waiting scheduler work, healthy follow-up. Historical vLLM run passed; earlier #15091 candidate also collected and passed, 0 ignored. |
+| C9 | CPU wire `cancellation::vllm_consumer_drop_releases_active_scheduler_work` | Drop live consumer without stop or Abort; observe active scheduler first, then remote drop and zero running/waiting scheduler work, healthy follow-up. Historical vLLM run passed; earlier #15091 candidate also collected and passed, 0 ignored. |
+| R13 direct cleanup | CPU wire `lifecycle::vllm_cleanup_during_read_and_post_cleanup_admission` | Live-stream cancellation and post-cleanup generation cannot submit native work; #15243 moves only vLLM before-start error and repeatable cleanup into isolated coverage; SGLang retains its foundation checks. Historical vLLM run passed; earlier #15091 candidate also collected and passed, 0 ignored. |
+| C7 peer termination; framework bounded teardown | CPU wire `lifecycle::vllm_teardown_terminates_handlers_with_clients_alive` | Abruptly terminate dedicated native server runtime while real engine and stream objects remain alive; join runtime, observe handler and scheduler release, exact prefix plus typed failure. Historical vLLM run passed; earlier #15091 candidate also collected and passed, 0 ignored. |
 | Native request cache namespace, structured outputs, metadata/KV sources, engine config; connection reuse; opaque prefill/decode; EPD; RL/LoRA | Existing vLLM socket tests | Retained. Broad old aggregate test has distinct assertions beyond shared C4. |
 | Mocker prefill/decode opaque handoff and KV relay/indexer | Existing `lib/mocker/servers/vllm/tests/sidecar.rs` | Retained: opaque manual handoff and KV relay/indexer have distinct assertions. |
 | SGLang foundation and Mocker suites; TensorRT-LLM owning suites | Existing owners | Retain the four SGLang conformance cases and all four SGLang Mocker cases; no new backend activation or migration. |
@@ -87,8 +94,10 @@ unnumbered restrictions; [DEVIATIONS.md](DEVIATIONS.md) records departures.
 
 ## Validation commands
 
-The runner and CPU-container commands are in [README.md](README.md). Direct
-wire commands, including retained SGLang coverage, are:
+The ordinary workspace command, `cargo test --locked --all-targets`, runs the
+unit and wire suites without custom selectors. Process and native commands are
+in [PROCESS.md](PROCESS.md) and [NATIVE.md](NATIVE.md). Direct wire commands,
+including retained SGLang coverage, are:
 
 ```sh
 cargo test --locked -p dynamo-sidecar-testkit --test conformance -- --list
@@ -98,7 +107,35 @@ cargo test --locked -p dynamo-sglang-mocker --test sidecar
 cargo clippy --locked -p dynamo-sidecar-testkit --test conformance --no-deps -- -D warnings
 ```
 
-Refreshed #14879 at `286d6fd5bbfe10efb9c929edca6c3185032b84cc` passed eight
+## Local validation of the #15243 restack
+
+The integration candidate merges `bdf5b5ee65` with unit head `40c329fe2b`.
+The following checks executed locally before assigning a final merge commit:
+
+| Selection | Passed |
+| --- | ---: |
+| Shared conformance | 13: nine vLLM and four SGLang |
+| Retained Mocker suites | Six: two vLLM and four SGLang |
+| Process suite with the rebuilt real sidecar executable | Six, in 22.42 seconds |
+| Common/vLLM all-targets | 119: 13 common library, 105 vLLM library and one CLI case |
+| Testkit controller regression | One |
+| Runtime cancellation before response setup and media-retention guard | Three |
+
+All listed tests passed with zero failures or ignored cases. The library row
+includes all 82 isolated units and the 34 retained cases in `vllm/src/tests.rs`;
+those are not additional executions. Formatting, pre-commit, workflow YAML,
+shell syntax and testkit Clippy for all process/native targets passed, with
+Clippy warnings denied. Full-workspace tests, current-head GitHub CI and
+GPU/native-engine execution are not claimed. The native-transfer blockers
+remain as recorded in [NATIVE.md](NATIVE.md).
+
+The workflow's native build, JSON artifact selection and stripped executable
+export passed; the exported binary listed all three native cases. Listing
+does not execute those GPU scenarios.
+
+## Historical validation before the #15243 restack
+
+#14879 at `286d6fd5bbfe10efb9c929edca6c3185032b84cc` passed eight
 shared and eight retained Mocker cases locally, and Clippy passed. Its exact
 trusted copy activated full PR run 35791357457 and Pre Merge 35791350230;
 the initial CI snapshot was still pending. Refreshed #15089 at
@@ -106,9 +143,10 @@ the initial CI snapshot was still pending. Refreshed #15089 at
 CPU container, 102 total common/vLLM library cases, eight conformance cases and
 eight retained Mocker cases. Formatting, Clippy, pre-commit and ownership checks
 passed. The 62 isolated cases are part of the 102-library selection, not an
-additional set. UNITS.md owns the detailed fresh unit evidence.
+additional set. [UNITS.md](UNITS.md) owns revision-specific unit evidence, including the later
+82-case suite. These historical counts are not the restacked suite inventory.
 
-## Refreshed integration execution
+### Earlier integration execution on the refreshed main base
 
 The #15091 candidate based on `b3ab1638513e255828acddc40f045d069ed6bc33`,
 including the strengthened native-rejection setup and held-header cancellation
@@ -129,15 +167,11 @@ library selections, these runner selections are disjoint. The separate
 `--framework vllm --level all --list` artifact collection returned 116 cases,
 excluding the eight retained SGLang cases; it is not a second execution.
 
-```bash
-python3 lib/sidecar/testkit/run.py --framework all --level all --export "$artifacts"
-docker build -f lib/sidecar/testkit/CPU.Dockerfile -t sidecar-cpu "$artifacts"
-docker run --rm --network none sidecar-cpu --framework all --level all
-python3 lib/sidecar/testkit/run.py --framework vllm --level all --artifacts "$artifacts" --list
-cargo clippy --locked -p dynamo-sidecar-testkit --features process-tests,native-tests --all-targets --no-deps -- -D warnings
-```
+The removed Python runner and CPU-container exporter produced that historical
+selection. Current execution uses the direct Cargo commands above and the
+feature-gated process/native commands in their owning reports.
 
-The runner listed each selection before executing it and rejected failures,
+That historical runner listed each selection before executing it and rejected failures,
 ignored cases or count mismatches. Recorded artifacts are
 `restack/integration-container.log`, `restack/integration-vllm-collection.log`,
 and `restack/integration-clippy.log` in the separate execution report. Clippy

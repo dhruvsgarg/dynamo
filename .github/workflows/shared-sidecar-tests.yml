@@ -48,15 +48,28 @@ jobs:
             ~/.cargo/registry
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
-      - name: Run isolated CPU integration
+      - name: Run CPU integration
+        shell: bash
+        env:
+          HF_HUB_OFFLINE: '1'
+          CUDA_VISIBLE_DEVICES: ''
+        run: |
+          set -euo pipefail
+          cargo test --locked -p dynamo-sidecar-testkit --test conformance
+          cargo test --locked -p dynamo-vllm-mocker -p dynamo-sglang-mocker --test sidecar
+          cargo build --locked -p dynamo-vllm-sidecar --bin dynamo-vllm-sidecar
+          cargo test --locked -p dynamo-sidecar-testkit --features process-tests --test cross_process -- --test-threads=1 --nocapture
+      - name: Build native compatibility executable
         shell: bash
         run: |
           set -euo pipefail
-          python3 lib/sidecar/testkit/run.py --level integration --export "${RUNNER_TEMP}/sidecar-cpu"
-          docker build -f lib/sidecar/testkit/CPU.Dockerfile -t sidecar-process-tests "${RUNNER_TEMP}/sidecar-cpu"
-          docker run --rm --network none sidecar-process-tests --level integration
-      - name: Build native compatibility executable
-        run: python3 lib/sidecar/testkit/run.py --level native --export "${RUNNER_TEMP}/sidecar-native"
+          cargo test --locked -p dynamo-sidecar-testkit --features native-tests --test native_engine --no-run --message-format=json > "${RUNNER_TEMP}/sidecar-native-build.jsonl"
+          executable=$(jq -ser '
+            [.[] | select(.reason == "compiler-artifact" and .profile.test == true and .target.name == "native_engine" and .executable != null)]
+            | if length == 1 then .[0].executable else error("expected one native_engine executable") end
+          ' "${RUNNER_TEMP}/sidecar-native-build.jsonl")
+          mkdir -p "${RUNNER_TEMP}/sidecar-native"
+          strip -o "${RUNNER_TEMP}/sidecar-native/native_engine" "$executable"
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6.0.0
         with:
           name: sidecar-native-${{ inputs.source_ref || github.sha }}

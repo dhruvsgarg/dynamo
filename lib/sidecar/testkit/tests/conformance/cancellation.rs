@@ -104,7 +104,7 @@ async fn read_isolation<F: SidecarFixture>(
     let mut stream_a = bounded(
         "request A opening",
         engine.generate(
-            request("mocker-model", vec![11, 22, 33], 4),
+            request("mocker-model", vec![11, 22, 33], 8),
             GenerateContext::new(ctx_a.clone(), None),
         ),
     )

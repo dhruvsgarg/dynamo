@@ -33,7 +33,7 @@ pub(super) async fn failure_case<F: SidecarFixture>(
     let ctx = mock_context();
     let fails_open = matches!(plan.open, OpenAction::Fail);
     let handle = control.request(ctx.id(), plan);
-    let req = request("mocker-model", vec![11, 22, 33], 3);
+    let req = request("mocker-model", vec![11, 22, 33], 6);
     let ctx = GenerateContext::new(ctx, None);
     let outputs = if fails_open {
         collect(&engine, req, ctx).await

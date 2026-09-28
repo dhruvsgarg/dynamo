@@ -42,7 +42,7 @@ pub(super) async fn cleanup<F: SidecarFixture>(
     let mut stream = bounded(
         "generation opening",
         engine.generate(
-            request("mocker-model", vec![11, 22, 33], 3),
+            request("mocker-model", vec![11, 22, 33], 6),
             GenerateContext::new(ctx, None),
         ),
     )

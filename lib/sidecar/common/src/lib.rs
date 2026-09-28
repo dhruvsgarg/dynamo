@@ -27,5 +27,5 @@ pub use error::{
 pub use transport::{DEFAULT_MAX_GRPC_MESSAGE_SIZE, GrpcChannelPool, format_error_chain};
 
 #[cfg(test)]
-#[path = "../../testkit/tests/unit/common/transport.rs"]
-mod unit_transport;
+#[path = "transport/tests.rs"]
+mod transport_tests;

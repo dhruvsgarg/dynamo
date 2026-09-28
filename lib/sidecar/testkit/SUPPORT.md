@@ -6,7 +6,7 @@
 This ledger accounts for all **162 capability IDs** in the read-only DEP Support
 Matrix and its two unnumbered structured-output restrictions. It refreshes that
 matrix's Dynamo `8e9a96f` / vLLM 0.28 assumptions against the implementation base
-`4a0547f8ba2675f14d50e48d6aec53b1bc3cf3e3`, the merge-based #14879 → #15089 → #15091
+`4a0547f8ba2675f14d50e48d6aec53b1bc3cf3e3`, the merge-based #14879 → #15243 → #15091
 stack, published
 `vllm-proto` 0.3.0, and vLLM 0.29.0
 (`98dff2a81d747d1dba01a47f939f48c3526d4206`). Pins are in
@@ -24,7 +24,11 @@ separately owned E2E, performance and deployment work.
 
 ## Evidence and ownership
 
-Refreshed #14879 at `286d6fd5` passed eight shared and eight retained Mocker
+The current unit owner is #15243: 82 ordinary cases, 11 common and 71 vLLM.
+Its revision-specific results are in [UNITS.md](UNITS.md). The integration
+results below predate this restack and cannot certify its new head.
+
+Historically, #14879 at `286d6fd5` passed eight shared and eight retained Mocker
 cases locally, plus Clippy. Refreshed #15089 at
 `b3ab1638513e255828acddc40f045d069ed6bc33` passed 62 isolated container cases,
 102 total common/vLLM library cases, eight conformance cases and eight retained
@@ -42,10 +46,10 @@ a coverage row does not convert those results into new-head validation.
 
 | Label | Owner and execution evidence |
 | --- | --- |
-| U | #15089 [isolated units](UNITS.md): 62 isolated container cases passed at `b3ab1638`; all 102 common/vLLM library cases also passed (overlapping selection). Final current-head CI remains pending. |
-| R | Retained [vLLM socket tests][retained], including LoRA/RL/media/metadata: the refreshed integration candidate collected and passed 37 (2 common, 35 vLLM), 0 ignored; U is separate. Historical execution also passed this selection. |
-| W | #14879 foundation extended by #15091 [CPU wire](COVERAGE.md): the refreshed integration candidate collected and passed nine vLLM/four SGLang conformance cases and two vLLM/four SGLang [Mocker cases][mocker], 0 ignored. The prior nine vLLM/two vLLM Mocker pass remains historical. |
-| P | #15091 [process integration](PROCESS.md): all six collected and passed on the refreshed candidate with the real sidecar, 0 ignored, 22.46 seconds. Refreshed runtime regression selections also passed; their overlaps are recorded in PROCESS.md. The prior six-case pass remains historical. |
+| U | #15243 [isolated units](UNITS.md): 82 ordinary unit cases, included in its 121 passing common/vLLM library cases at `40c329fe2b`. Historical #15089 results remain separately recorded; integration-restack validation is separate. |
+| R | Retained [vLLM socket tests][retained], including LoRA/RL/media/metadata: the restacked source has 34 vLLM and two common cases; the local LoRA lock-registry case now belongs to U. The historical integration candidate passed 37 (2 common, 35 vLLM), before that migration. |
+| W | #14879 foundation extended by #15091 [CPU wire](COVERAGE.md): the historical integration candidate collected and passed nine vLLM/four SGLang conformance cases and two vLLM/four SGLang [Mocker cases][mocker], 0 ignored. The prior nine vLLM/two vLLM Mocker pass remains historical. |
+| P | #15091 [process integration](PROCESS.md): all six collected and passed on the historical candidate with the real sidecar, 0 ignored, 22.46 seconds. Refreshed runtime regression selections also passed; their overlaps are recorded in PROCESS.md. The prior six-case pass remains historical. |
 | N | #15091 [native integration](NATIVE.md): refreshed real-GPU cancellation/drop and logprob/structured-output compatibility passed; handoff again failed before transfer on the pinned upstream defect. Two-GPU success and native transfer-time cancellation remain blocked. |
 | S | Existing shared-production or other owning tests cited below were retained and inspected; this reconciliation does **not** claim their execution. Existing CI remains allocated. |
 | Unsupported | No supported sidecar contract is invented. Rejection tests cover expressible inputs where identified. |
@@ -69,7 +73,7 @@ source inspection and CI configuration are not executions.
 Historically completed before restacking: **B14 / B20 / B21 / J2**, C13's native logprob
 and structured-output case passed on the pinned engine. It checks aligned
 candidate and prompt metadata, exact usage, and parsed schema-conforming text.
-Revalidated at the refreshed unit boundary: **G5**, a new isolated `draft_updates_require_both_native_capabilities` case
+Historically revalidated at the `b3ab1638` unit boundary: **G5**, a new isolated `draft_updates_require_both_native_capabilities` case
   checks absent capabilities and all flag combinations, exact advertisement and
   rejection before accessing a native client. The focused case and final 62-unit isolated CPU container passed. The
   retained positive route case continues to cover successful updates.
@@ -229,7 +233,7 @@ from v0.29.0; its merge commit is not an ancestor of the pin.
 | J1 | U isolates existing pure assertions plus distinct additions; R keeps native socket assertions. Counts and relocation mapping are in UNITS.md, not the stale 29-test source count. Shared code runs once. |
 | J2 | Dependency pinning plus independent real-engine N provides compatibility evidence; a second serializer using the same generated crate would not detect a shared wrong schema. No general released-tag golden matrix is claimed. Required native handoff remains blocked; C13 also passed the refreshed execution. Existing SGLang golden-wire coverage is untouched. |
 | J3 | Stale absent-E2E claim: existing `tests/serve/test_sidecar.py` covers all three aggregate sidecar launchers. It remains unchanged; new `tests/sidecar/test_native_integration.py` is direct integration, not replacement E2E. |
-| J4, J5 | #14879 retained pre-merge workspace wire lane; #15089 isolated common/vLLM units; #15091 additional pre-merge wire and post-merge/nightly process/direct-native lanes. See [runner](run.py) and [CI workflow][ci]. Existing E2E allocation remains. Historical results above do not establish refreshed current-head CI. |
+| J4, J5 | #14879 retained wire tests and #15243 common/vLLM units run with ordinary workspace Cargo commands. #15091 adds pre-merge wire coverage and feature-gated post-merge/nightly process/direct-native execution. See [commands](README.md) and [CI workflow][ci]. Existing E2E allocation remains. Historical results do not establish current-head CI. |
 | J6 | Configured nightly tests use the pinned Dynamo engine image, not arbitrary upstream HEAD. Upstream-engine CI ownership/bump campaigns are separate; no unobserved upstream run is credited. |
 | J7 | In-process versus sidecar differential generation remains separately owned E2E/performance work; no no-regression parity claim from CPU equality assertions. |
 | J8 | Native XPU/non-CUDA engine lanes are deferred absent a distinct adapter contract. CPU no-engine execution is not XPU inference validation. Existing hardware suites remain unchanged. |

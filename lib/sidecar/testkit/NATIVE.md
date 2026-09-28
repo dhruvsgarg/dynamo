@@ -9,14 +9,15 @@ cancellation or consumer drop, and actual KV transfer between native engines. Th
 to the Rust sidecar engine. There is no Dynamo frontend or new E2E deployment.
 The existing E2E tests and their CI allocation are unchanged.
 
-This is #15091's vLLM-only native increment above #14879 and #15089, refreshed
+This is #15091's vLLM-only native increment above #14879 and #15243, refreshed
 onto main `4a0547f8ba2675f14d50e48d6aec53b1bc3cf3e3`. The existing SGLang wire foundation
 and Mocker cases remain; no new SGLang native activation is added. Native
-execution on the refreshed stack is recorded below; current-head CI remains pending.
+execution on the previous stack is recorded below; it does not validate this
+restack. Current-head CI remains pending.
 
-The preceding #15089 boundary at `b3ab1638` passed its isolated unit, full
-common/vLLM library and retained foundation/Mocker suites, as recorded in
-[UNITS.md](UNITS.md). Those results do not execute this integration layer.
+The #15243 unit boundary at `40c329fe2b` passed its common/vLLM tests, as
+recorded in [UNITS.md](UNITS.md). Those results do not execute this integration
+layer. Native tests keep their `native-tests` feature and GPU workflow allocation.
 
 The launcher requires both vLLM and its bundled `vllm-rs` to report 0.29.0. Dynamo
 uses the published `vllm-proto` 0.3.0. Missing binaries, pins, metrics, telemetry or
@@ -26,7 +27,16 @@ The cancellation case reserves one GPU; handoff reserves two in CI. Both use
 unique ports and bounded owned-process cleanup through the existing ManagedProcess.
 
 ```sh
-python3 lib/sidecar/testkit/run.py --level native --export "$native_artifacts"
+mkdir -p "$native_artifacts"
+cargo test --locked -p dynamo-sidecar-testkit --features native-tests \
+  --test native_engine --no-run --message-format=json > "$native_artifacts/cargo.json"
+native_binary=$(jq -r '
+  select(.reason == "compiler-artifact" and .profile.test and .executable)
+  | select(.target.name == "native_engine" and .target.kind == ["test"])
+  | .executable
+' "$native_artifacts/cargo.json")
+test -f "$native_binary"
+strip -o "$native_artifacts/native_engine" "$native_binary"
 DYNAMO_SIDECAR_NATIVE_TEST="$native_artifacts/native_engine" \
   python3 -m pytest -vv tests/sidecar/test_native_integration.py
 ```
@@ -35,8 +45,9 @@ Choose `native_artifacts` on the configured external build storage.
 For an existing cache use the repository's `--models-dir` pytest option.
 `SIDECAR_NATIVE_MODEL_PATH` may select a local snapshot of that same model, and
 `SIDECAR_NATIVE_GPUS` may select assigned GPU IDs. The launcher otherwise respects
-`CUDA_VISIBLE_DEVICES`. `native` is excluded from `all`; directly executing the
-Rust target without the launcher cannot establish its required resources.
+`CUDA_VISIBLE_DEVICES`. The `native-tests` feature is disabled by default;
+directly executing the Rust target without the launcher cannot establish its
+required resources.
 
 | Case | Required observation | Boundary |
 | --- | --- | --- |
@@ -51,7 +62,7 @@ It changes no request, output, scheduler policy or transfer result. Every case
 starts fresh engines and a fresh observation file. Successful generation alone
 never satisfies the transfer assertion.
 
-## Refreshed execution
+## Historical execution before the #15243 restack
 
 The integration candidate based on unit head `b3ab1638` and refreshed main
 `4a0547f8` collected and executed all three launcher cases on 2026-09-22:

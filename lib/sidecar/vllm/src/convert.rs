@@ -1245,13 +1245,7 @@ fn normalize_logprob(logprob: f32) -> f64 {
 }
 
 #[cfg(test)]
-#[path = "../../testkit/tests/unit/requests/candidates.rs"]
-mod unit_candidates;
+mod request_tests;
 
 #[cfg(test)]
-#[path = "../../testkit/tests/unit/requests/vllm.rs"]
-mod unit_requests;
-
-#[cfg(test)]
-#[path = "../../testkit/tests/unit/responses/vllm.rs"]
-mod unit_responses;
+mod response_tests;
