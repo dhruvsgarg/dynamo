@@ -1123,8 +1123,18 @@ impl ModelDeploymentCard {
                 if let Some(model_dir) = p.parent() {
                     crate::tokenizers::hf::merge_special_tokens_from_config(&mut hf, model_dir);
                 }
+                // RocketKV (tokenizer_backends.rs): encoder placement, cache policy, parity.
+                let encoder = crate::tokenizer_backends::encoder_kind()?;
+                let policy_v2 = cache_enabled && crate::tokenizer_backends::cache_policy_v2()?;
+                let parity_ref = matches!(
+                    std::env::var("DYN_TOKENIZER_PARITY").ok().as_deref(),
+                    Some("1")
+                )
+                .then(|| hf.clone());
+                // v2 proves composability on the exact tokenizer the segments use.
+                let policy_source = policy_v2.then(|| hf.clone());
                 // Hold onto specials before any move of `hf`.
-                let specials: Vec<String> = if cache_enabled {
+                let specials: Vec<String> = if cache_enabled && !policy_v2 {
                     extract_hf_special_tokens(&hf)
                 } else {
                     Vec::new()
@@ -1161,29 +1171,65 @@ impl ModelDeploymentCard {
                     Arc::new(wrap_hf(hf))
                 };
 
-                if cache_enabled {
-                    tracing::info!(
-                        cache_bytes,
-                        cache_extend,
-                        specials = specials.len(),
-                        "wrapping tokenizer in L1 prefix cache",
+                let on_hit: crate::tokenizer_backends::CacheEventFn = Arc::new(|| {
+                    dynamo_runtime::metrics::frontend_perf::TOKENIZER_CACHE_HITS_TOTAL.inc();
+                });
+                let on_miss: crate::tokenizer_backends::CacheEventFn = Arc::new(|| {
+                    dynamo_runtime::metrics::frontend_perf::TOKENIZER_CACHE_MISSES_TOTAL.inc();
+                });
+                use crate::tokenizer_backends::EncoderKind;
+                if encoder != EncoderKind::Host && cache_enabled {
+                    anyhow::bail!(
+                        "DYN_TOKENIZER_ENCODER={encoder:?} owns its cache: set DYN_TOKENIZER_CACHE=0"
                     );
-                    Arc::new(
-                        crate::tokenizers::CachedTokenizer::new(raw, specials, cache_bytes)
-                            .with_extend(cache_extend)
-                            .with_observer(
-                                Arc::new(|| {
-                                    dynamo_runtime::metrics::frontend_perf::TOKENIZER_CACHE_HITS_TOTAL
-                                        .inc();
-                                }),
-                                Arc::new(|| {
-                                    dynamo_runtime::metrics::frontend_perf::TOKENIZER_CACHE_MISSES_TOTAL
-                                        .inc();
-                                }),
-                            ),
-                    )
-                } else {
-                    raw
+                }
+                let tok: Arc<dyn crate::tokenizers::traits::Tokenizer> = match encoder {
+                    EncoderKind::Host if cache_enabled && policy_v2 => {
+                        Arc::new(crate::tokenizer_backends::CachedTokenizerV2::new(
+                            raw,
+                            policy_source.as_ref().expect("cloned when policy_v2"),
+                            cache_bytes as u64,
+                            on_hit,
+                            on_miss,
+                        ))
+                    }
+                    EncoderKind::Host if cache_enabled => {
+                        tracing::info!(
+                            cache_bytes,
+                            cache_extend,
+                            specials = specials.len(),
+                            "wrapping tokenizer in L1 prefix cache",
+                        );
+                        Arc::new(
+                            crate::tokenizers::CachedTokenizer::new(raw, specials, cache_bytes)
+                                .with_extend(cache_extend)
+                                .with_observer(on_hit, on_miss),
+                        )
+                    }
+                    EncoderKind::Host => raw,
+                    EncoderKind::Remote => {
+                        let addr = std::env::var("DYN_TOKENIZER_REMOTE")
+                            .context("DYN_TOKENIZER_ENCODER=remote needs DYN_TOKENIZER_REMOTE=host:port")?;
+                        Arc::new(crate::tokenizer_backends::RemoteTokenizer::new(
+                            addr, raw, on_hit, on_miss,
+                        )?)
+                    }
+                    EncoderKind::Cmm => {
+                        let cached = matches!(
+                            std::env::var("DYN_TOKENIZER_CMM_CACHE").ok().as_deref(),
+                            Some("1")
+                        );
+                        Arc::new(crate::tokenizer_backends::CmmTokenizer::new(
+                            cached, raw, on_hit, on_miss,
+                        )?)
+                    }
+                };
+                match parity_ref {
+                    Some(reference) => Arc::new(crate::tokenizer_backends::ParityTokenizer::new(
+                        tok,
+                        crate::tokenizers::HuggingFaceTokenizer::from_tokenizer(reference),
+                    )?),
+                    None => tok,
                 }
             }
             Some(TokenizerKind::TikTokenModel(checked_file)) => {

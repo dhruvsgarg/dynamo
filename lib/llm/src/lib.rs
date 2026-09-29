@@ -36,6 +36,10 @@ pub mod request_trace;
 pub mod session_affinity;
 pub mod telemetry;
 pub use dynamo_tokenizers as tokenizers;
+// RocketKV CMM experiment: host cache policy v2, remote/CMM encoders, parity, off-runtime encode.
+pub mod tokenizer_backends;
+pub mod tokenizer_cache_policy;
+pub mod tokenizer_prefix_v2;
 pub use dynamo_tokenizers::{file_json_field, log_json_err};
 pub mod tokens;
 pub mod types;
