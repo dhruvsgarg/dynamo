@@ -39,6 +39,7 @@ import (
 	"github.com/ai-dynamo/dynamo/deploy/operator/internal/discovery"
 	"github.com/ai-dynamo/dynamo/deploy/operator/internal/dra"
 	"github.com/ai-dynamo/dynamo/deploy/operator/internal/features"
+	"github.com/ai-dynamo/dynamo/deploy/operator/internal/features/compatibility"
 	gms "github.com/ai-dynamo/dynamo/deploy/operator/internal/gms"
 	"github.com/ai-dynamo/dynamo/deploy/operator/internal/runtimeversion"
 	grovev1alpha1 "github.com/ai-dynamo/grove/operator/api/core/v1alpha1"
@@ -1463,6 +1464,7 @@ type MultinodeDeployer interface {
 	GetLeaderHostname(serviceName string) string
 	GetHostNames(serviceName string, numberOfNodes int32) []string
 	GetNodeRank() (string, bool) // returns (rank, needsShellInterpretation)
+	GetPodRank() string          // returns the current pod's absolute rank in Kubernetes env-var syntax
 	NeedsDNSWait() bool          // returns true if DNS wait is needed to launch multinode components
 }
 
@@ -1607,6 +1609,28 @@ func AddTransportTLSEnvVars(container *corev1.Container, operatorConfig *configv
 	container.Env = MergeEnvs(tlsEnvVars, container.Env)
 }
 
+// addMultinodeTopologyEnvVars injects backend-independent aliases for the
+// current pod's rank and leader address into newly created multinode DGDs.
+func addMultinodeTopologyEnvVars(
+	container *corev1.Container,
+	numberOfNodes int32,
+	serviceName string,
+	multinodeDeployer MultinodeDeployer,
+	annotations map[string]string,
+) {
+	if numberOfNodes <= 1 || !compatibility.MultinodeTopologyAliases.Enabled(annotations) {
+		return
+	}
+
+	// The aliases are operator-owned so their topology-derived values override
+	// any same-named entries supplied by the component pod template.
+	topologyEnvVars := []corev1.EnvVar{
+		{Name: commonconsts.DynamoLeaderAddressEnvVar, Value: multinodeDeployer.GetLeaderHostname(serviceName)},
+		{Name: commonconsts.DynamoRankEnvVar, Value: multinodeDeployer.GetPodRank()},
+	}
+	container.Env = MergeEnvs(container.Env, topologyEnvVars)
+}
+
 // applyDefaultSecurityContext sets secure defaults for pod security context.
 // Currently only sets fsGroup to solve volume permission issues.
 // Does NOT set runAsUser/runAsGroup/runAsNonRoot to maintain backward compatibility
@@ -1688,6 +1712,8 @@ func GenerateBasePodSpec(
 			return nil, fmt.Errorf("unsupported multinode deployment type: %s", multinodeDeploymentType)
 		}
 	}
+	addMultinodeTopologyEnvVars(&container, numberOfNodes, serviceName, multinodeDeployer, annotations)
+
 	backend := BackendFactory(backendFramework, operatorConfig, parentGraphDeploymentName)
 	if backend == nil {
 		return nil, fmt.Errorf("unsupported backend framework: %s", backendFramework)

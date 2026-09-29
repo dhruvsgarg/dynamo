@@ -5,7 +5,7 @@ go 1.26.6
 require (
 	emperror.dev/errors v0.8.1
 	github.com/Masterminds/semver/v3 v3.4.0
-	github.com/ai-dynamo/grove/operator/api v0.1.0-alpha.13
+	github.com/ai-dynamo/grove/operator/api v0.1.0-alpha.14-rc1
 	github.com/ai-dynamo/snapshot/api v0.1.0
 	github.com/bsm/gomega v1.27.10
 	github.com/evanphx/json-patch/v5 v5.9.11
