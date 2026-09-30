@@ -75,9 +75,12 @@ fn ids_of(e: Encoding) -> Vec<TokenIdType> {
 }
 
 /// Running per-backend telemetry, logged as one `tokstats` line every `DYN_TOKENIZER_STATS_EVERY`
-/// requests (default 16). `tok/dyn/summarize.py` reads the last line of the run.
+/// requests (default 16). `tok/dyn/summarize.py` reads the last line of the run. One request's update and the
+/// periodic line are serialised, so a line never mixes a half-added request into its sums (E0.8: n=32 carried 33
+/// requests' tokens and tripped the W0 replay check).
 struct TokStats {
     name: &'static str,
+    line: Mutex<()>,
     every: u64,
     n: AtomicU64,
     /// Summed over requests.
@@ -93,6 +96,7 @@ impl TokStats {
     fn with_last(name: &'static str, fields: &[&'static str], last: &[&'static str]) -> Self {
         Self {
             name,
+            line: Mutex::new(()),
             every: env_u64("DYN_TOKENIZER_STATS_EVERY", 16).max(1),
             n: AtomicU64::new(0),
             fields: fields.iter().map(|f| (*f, AtomicU64::new(0))).collect(),
@@ -103,6 +107,7 @@ impl TokStats {
         self.add_last(values, &[]);
     }
     fn add_last(&self, values: &[u64], last: &[u64]) {
+        let _line = self.line.lock().unwrap_or_else(|e| e.into_inner());
         for ((_, a), v) in self.fields.iter().zip(values) {
             a.fetch_add(*v, Ordering::Relaxed);
         }
