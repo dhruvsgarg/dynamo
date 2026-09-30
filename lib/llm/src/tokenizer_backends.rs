@@ -795,8 +795,43 @@ impl Tokenizer for ParityTokenizer {}
 
 type Job = Box<dyn FnOnce() + Send>;
 
+/// This thread's (CPU ns, system ns, minor page faults). System time and faults are the signature
+/// of the allocator returning pages to the kernel and faulting them back (Q17). Linux only.
+#[cfg(target_os = "linux")]
+fn thread_usage() -> (u64, u64, u64) {
+    let mut r: libc::rusage = unsafe { std::mem::zeroed() };
+    unsafe { libc::getrusage(libc::RUSAGE_THREAD, &mut r) };
+    let ns = |t: libc::timeval| t.tv_sec as u64 * 1_000_000_000 + t.tv_usec as u64 * 1000;
+    (ns(r.ru_utime) + ns(r.ru_stime), ns(r.ru_stime), r.ru_minflt as u64)
+}
+#[cfg(not(target_os = "linux"))]
+fn thread_usage() -> (u64, u64, u64) {
+    (0, 0, 0)
+}
+
+/// Where one prompt encode's time goes (T11): the encode itself (wall, CPU, system, faults),
+/// freeing the full encoding, and, through the pool, the wait for a thread and the hand-back.
+fn encode_stats(name: &'static str) -> TokStats {
+    TokStats::new(name, &["queue_us", "encode_us", "cpu_us", "sys_us", "faults", "free_us", "handback_us"])
+}
+
 pub struct OffloadPool {
     tx: Mutex<mpsc::Sender<Job>>,
+    /// `DYN_TOKENIZER_POOL_FULL=1`: hand the full encoding back (the pre-Q17 behaviour), an A/B only.
+    full: bool,
+    stats: Arc<TokStats>,
+}
+
+/// The stock path (`DYN_TOKENIZER_OFFLOAD=0`): encode on the calling tokio worker, measured the
+/// same way (queue, free and hand-back stay 0; the full encoding is freed later by Dynamo).
+pub fn encode_inline(tokenizer: &Arc<dyn Tokenizer>, text: &str) -> Result<Encoding> {
+    static STATS: OnceLock<TokStats> = OnceLock::new();
+    let stats = STATS.get_or_init(|| encode_stats("inline"));
+    let (t0, u0) = (Instant::now(), thread_usage());
+    let e = tokenizer.encode(text);
+    let (wall, u1) = (t0.elapsed(), thread_usage());
+    stats.add(&[0, wall.as_micros() as u64, (u1.0 - u0.0) / 1000, (u1.1 - u0.1) / 1000, u1.2 - u0.2, 0, 0]);
+    e
 }
 
 /// `Some` when `DYN_TOKENIZER_OFFLOAD=1`; `DYN_TOKENIZER_THREADS` threads (default: the CPUs
@@ -826,8 +861,9 @@ pub fn offload_pool() -> Option<&'static OffloadPool> {
                 })
                 .expect("spawn tokenizer pool thread");
         }
-        tracing::info!(threads = n, "prompt encode off the runtime (DYN_TOKENIZER_OFFLOAD=1)");
-        Some(OffloadPool { tx: Mutex::new(tx) })
+        let full = env_on("DYN_TOKENIZER_POOL_FULL");
+        tracing::info!(threads = n, full, "prompt encode off the runtime (DYN_TOKENIZER_OFFLOAD=1)");
+        Some(OffloadPool { tx: Mutex::new(tx), full, stats: Arc::new(encode_stats("pool")) })
     })
     .as_ref()
 }
@@ -837,15 +873,28 @@ impl OffloadPool {
         let tok = tokenizer.clone();
         let text = text.to_owned();
         let (tx, rx) = mpsc::sync_channel(1);
+        let full = self.full;
+        let submitted = Instant::now();
         let job: Job = Box::new(move || {
             // Keep only the IDs (all the prompt path reads) and free the full encoding here, on the
             // thread that allocated it. Returning it made the caller free ~16K token strings and
             // offsets allocated by another thread: 89.5 vs 16.2 CPU-ms per 16K-token encode on gnr4
             // (tok_dynamo.md Q17, `toksvc bench` c vs a).
-            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                tok.encode(&text).map(|e| Encoding::Sp(ids_of(e)))
-            }));
-            let _ = tx.send(r);
+            let started = Instant::now();
+            let u0 = thread_usage();
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tok.encode(&text)));
+            let (encoded, u1) = (Instant::now(), thread_usage());
+            let r = r.map(|e| e.map(|e| if full { e } else { Encoding::Sp(ids_of(e)) }));
+            let freed = Instant::now();
+            let times = [
+                (started - submitted).as_micros() as u64,
+                (encoded - started).as_micros() as u64,
+                (u1.0 - u0.0) / 1000,
+                (u1.1 - u0.1) / 1000,
+                u1.2 - u0.2,
+                (freed - encoded).as_micros() as u64,
+            ];
+            let _ = tx.send((r, times, freed));
         });
         self.tx
             .lock()
@@ -860,8 +909,13 @@ impl OffloadPool {
             _ => wait(),
         };
         match r {
-            Ok(Ok(result)) => result,
-            Ok(Err(panic)) => std::panic::resume_unwind(panic),
+            Ok((r, t, freed)) => {
+                self.stats.add(&[t[0], t[1], t[2], t[3], t[4], t[5], freed.elapsed().as_micros() as u64]);
+                match r {
+                    Ok(result) => result,
+                    Err(panic) => std::panic::resume_unwind(panic),
+                }
+            }
             Err(_) => bail!("tokenizer pool dropped the request"),
         }
     }

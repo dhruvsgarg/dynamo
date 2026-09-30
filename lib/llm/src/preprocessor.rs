@@ -1992,7 +1992,7 @@ impl OpenAIPreprocessor {
         // RocketKV A9: off the tokio runtime when DYN_TOKENIZER_OFFLOAD=1 (stock: on the worker).
         let encoding = match crate::tokenizer_backends::offload_pool() {
             Some(pool) => pool.encode(&self.tokenizer, prompt.as_ref())?,
-            None => self.tokenizer.encode(prompt.as_ref())?,
+            None => crate::tokenizer_backends::encode_inline(&self.tokenizer, prompt.as_ref())?,
         };
         if let Some(t) = tracker {
             t.record_tokenize_latency(encode_start.elapsed());
