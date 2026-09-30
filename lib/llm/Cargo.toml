@@ -86,6 +86,8 @@ hf-hub = { workspace = true }
 ipnet = { workspace = true }
 lru = { workspace = true }
 moka = { workspace = true, features = ["sync"] }
+# RocketKV tokenizer_cache_policy.rs: candidate cuts (Q16); already in the lock via tokenizers
+aho-corasick = "1"
 libc = { workspace = true }
 rand = { workspace = true }
 oneshot = { workspace = true }

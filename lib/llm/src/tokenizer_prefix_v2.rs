@@ -6,7 +6,8 @@
 //! builders' ARM cache (RocketKV `tok/rust/src/prefix.rs`, `25f6a7f`):
 //! - the pipeline is proven composable once (`PrefixCachePolicy`); otherwise every request is one
 //!   complete encode, never a cached split, and is counted as neither hit nor miss;
-//! - boundaries come from the library's own added-token matcher on every request;
+//! - cuts come from the library's own added-token matcher; a hit rescans only from the key's
+//!   restart point, a miss scans the whole prompt (proof in `tokenizer_cache_policy.rs`);
 //! - keys are the exact prefix bytes (`Arc<str>`): no hash-collision reuse;
 //! - the budget charges key bytes + 4 B per ID.
 //!
@@ -58,10 +59,17 @@ pub struct Stats {
     pub admission_drops: u64,
 }
 
+/// A cached prefix: its IDs and where a later prompt that starts with it may rescan from.
+#[derive(Clone)]
+struct Entry {
+    ids: Arc<[u32]>,
+    restart: usize,
+}
+
 pub struct PrefixCacheV2 {
     policy: Option<PrefixCachePolicy>,
     disabled: Option<String>,
-    index: Cache<Arc<str>, Arc<[u32]>>,
+    index: Cache<Arc<str>, Entry>,
     capacity: u64,
     hits: AtomicU64,
     misses: AtomicU64,
@@ -84,8 +92,8 @@ impl PrefixCacheV2 {
         let count = evictions.clone();
         let index = Cache::builder()
             .max_capacity(capacity)
-            .weigher(|key: &Arc<str>, ids: &Arc<[u32]>| {
-                (key.len() + ids.len() * 4).min(u32::MAX as usize) as u32
+            .weigher(|key: &Arc<str>, entry: &Entry| {
+                (key.len() + entry.ids.len() * 4).min(u32::MAX as usize) as u32
             })
             .eviction_listener(move |_, _, cause| {
                 if cause == RemovalCause::Size {
@@ -130,22 +138,26 @@ impl PrefixCacheV2 {
             };
             return Ok((ids, outcome));
         };
-        let boundaries = policy.boundaries(text);
         let mut found = None;
-        for &end in boundaries.iter().rev() {
+        for end in policy.candidates(text).into_iter().rev() {
             // Arc<str> equality checks every prefix byte: a hash collision cannot reuse IDs.
-            if let Some(ids) = self.index.get(&text[..end]) {
-                found = Some((end, ids));
-                break;
+            if let Some(entry) = self.index.get(&text[..end]) {
+                // Appended bytes can make a longer added token win over this cut: confirm it
+                // with the library's matcher from the key's restart point (and learn the cuts after it).
+                let scan = policy.scan(text, entry.restart);
+                if scan.cuts.contains(&end) {
+                    found = Some((end, entry.ids, scan));
+                    break;
+                }
             }
         }
-        let (ids, outcome) = if let Some((prefix, cached)) = found {
-            let deepest = *boundaries.last().expect("a hit implies a boundary");
+        let (ids, outcome) = if let Some((prefix, cached, scan)) = found {
+            let deepest = *scan.cuts.last().expect("the prefix is a cut");
             let mut ids = Vec::with_capacity(cached.len() + (text.len() - prefix) / 2 + 16);
             ids.extend_from_slice(&cached);
             if deepest > prefix {
                 ids.extend(segment(&text[prefix..deepest])?);
-                self.insert(&text[..deepest], &ids);
+                self.insert(&text[..deepest], &ids, policy.restart(text, &scan, deepest));
                 ids.extend(segment(&text[deepest..])?);
             } else {
                 ids.extend(segment(&text[prefix..])?);
@@ -158,11 +170,12 @@ impl PrefixCacheV2 {
             };
             (ids, outcome)
         } else {
+            let scan = policy.scan(text, 0);
             let mut ids = Vec::new();
             let mut previous = 0;
-            for &end in &boundaries {
+            for &end in &scan.cuts {
                 ids.extend(segment(&text[previous..end])?);
-                self.insert(&text[..end], &ids);
+                self.insert(&text[..end], &ids, policy.restart(text, &scan, end));
                 previous = end;
             }
             ids.extend(segment(&text[previous..])?);
@@ -183,13 +196,13 @@ impl PrefixCacheV2 {
         Ok((ids, outcome))
     }
 
-    fn insert(&self, key: &str, ids: &[u32]) {
+    fn insert(&self, key: &str, ids: &[u32], restart: usize) {
         let weight = key.len() as u64 + 4 * ids.len() as u64;
         if weight > self.capacity || weight > u32::MAX as u64 {
             self.drops.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        self.index.insert(Arc::from(key), Arc::from(ids));
+        self.index.insert(Arc::from(key), Entry { ids: Arc::from(ids), restart });
     }
 
     /// Cumulative counters. `sync` runs Moka's pending maintenance first (exact entries/bytes);
@@ -304,6 +317,65 @@ mod tests {
                 assert_eq!(c.encode(text, |s| full(&t, s)).unwrap().0, full(&t, text).unwrap());
             }
         }
+    }
+
+    /// Q16: restart-point rescans give the full scan's cuts, and cached encodes the full encode's
+    /// IDs, on random prompts built from overlapping added tokens and shared prefixes.
+    #[test]
+    fn restart_scans_equal_full_scans() {
+        let mut t = tokenizer();
+        t.add_special_tokens(&[
+            tokenizers::AddedToken::from("<s>x", true),
+            tokenizers::AddedToken::from("x<s", true),
+        ]);
+        // Ordinary added tokens that start before a special token and only match once more text is
+        // appended: the case a restart point too close to the key would get wrong.
+        t.add_tokens(&[
+            tokenizers::AddedToken::from("<s>xy", false).normalized(false),
+            tokenizers::AddedToken::from("y<s>x", false).normalized(false),
+            tokenizers::AddedToken::from("ey<s>xone", false).normalized(false),
+            tokenizers::AddedToken::from("y<s>one", false).normalized(false),
+        ]);
+        let policy = PrefixCachePolicy::new(&t).expect("eligible");
+        let pieces = ["shared", "private", " ", "<s>", "x", "y", "<", "s>", "<s>x", "one", "é", "e", "y<s>"];
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        let c = PrefixCacheV2::new(&t, 1 << 20);
+        let mut history = String::new();
+        for _ in 0..3000 {
+            match next(8) {
+                0 => history.clear(),
+                // Branch: back to an earlier point, then different text (a cached key followed by
+                // bytes its creator never saw).
+                1 | 2 if !history.is_empty() => {
+                    let mut at = next(history.len() + 1);
+                    while !history.is_char_boundary(at) {
+                        at -= 1;
+                    }
+                    history.truncate(at);
+                }
+                _ => {}
+            }
+            for _ in 0..1 + next(6) {
+                history.push_str(pieces[next(pieces.len())]);
+            }
+            let text = history.clone();
+            let full_scan = policy.scan(&text, 0);
+            for key in &full_scan.cuts {
+                let r = policy.restart(&text, &full_scan, *key);
+                let tail = policy.scan(&text, r);
+                let want: Vec<_> = full_scan.cuts.iter().copied().filter(|&b| b > r).collect();
+                assert_eq!(tail.cuts, want, "{text:?} from {r}");
+            }
+            let (ids, _) = c.encode(&text, |s| full(&t, s)).unwrap();
+            assert_eq!(ids, full(&t, &text).unwrap(), "{text:?}");
+        }
+        assert!(c.stats(true).hits > 0);
     }
 
     #[test]

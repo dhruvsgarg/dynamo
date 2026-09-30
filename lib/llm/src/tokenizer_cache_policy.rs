@@ -5,15 +5,46 @@
 //! A recognized, unconditional added token separates the library's normalization
 //! chunks. Only chunk-local pipeline stages and ID-preserving postprocessing are
 //! accepted. Unknown configurations use one complete encode instead of caching.
+//!
+//! Cuts come from the library's own added-token matcher, but not over the whole prompt on
+//! every request (tok_dynamo.md Q16: that pass cost as much as encoding the new suffix). A
+//! cached prefix carries a restart point; a hit rescans only from there. Why that is exact,
+//! for every tokenizer this policy accepts (every added token unnormalized, no lstrip/rstrip/
+//! single_word, so the matcher is leftmost-longest, non-overlapping Aho-Corasick on raw bytes):
+//!   (1) Scanning resumes at each match end and takes the leftmost-starting, then longest,
+//!       candidate. From any position r strictly inside no match of the full scan, a scan of
+//!       text[r..] reports exactly the full scan's matches that start at or after r.
+//!   (2) Whether a candidate starts at s depends only on text[s..s + L], L = the longest added
+//!       token. Two texts sharing their first c bytes therefore have identical matches up to
+//!       the first match that starts after c - L.
+//!   Hence a restart point of a key K that is <= |K| - L is a restart point of every text that
+//!   starts with K. `restart` picks one; a hit rescans from it and confirms that |K| is still a
+//!   cut (appended bytes can make a longer token win), and finds the cuts after it.
+//! Candidate keys come from a plain scan for every special-token occurrence (a superset of the
+//! cuts); only confirmed cuts are used, so hits and IDs equal the full scan's.
 
 use std::collections::HashMap;
 
+use aho_corasick::AhoCorasick;
 use serde_json::Value;
 use tokenizers::{AddedVocabulary, OffsetReferential, OffsetType, Tokenizer};
 
 pub struct PrefixCachePolicy {
     added: AddedVocabulary,
     specials: HashMap<u32, String>,
+    /// Every special token's text, for the candidate scan (overlapping: all occurrences).
+    special_finder: AhoCorasick,
+    /// Bytes of the longest added token (special or not): L in (2).
+    longest: usize,
+}
+
+/// The library's matches from one restart point to the end of a text.
+pub struct Scan {
+    from: usize,
+    /// Every added-token match (start, end), absolute byte offsets, in order.
+    matches: Vec<(usize, usize)>,
+    /// Ends of special-token matches before the end of the text, ascending: the cache cuts.
+    pub cuts: Vec<usize>,
 }
 
 impl PrefixCachePolicy {
@@ -60,6 +91,7 @@ impl PrefixCachePolicy {
         }) {
             return Err("added-token normalization/context flags are not validated".into());
         }
+        let longest = added.values().map(|token| token.content.len()).max().unwrap_or(0);
         let specials: HashMap<_, _> = added
             .into_iter()
             .filter(|(_, token)| token.special)
@@ -68,33 +100,77 @@ impl PrefixCachePolicy {
         if specials.is_empty() {
             return Err("no atomic special-token boundaries".into());
         }
+        let special_finder =
+            AhoCorasick::new(specials.values()).map_err(|error| error.to_string())?;
         Ok(Self {
             added: tokenizer.get_added_vocabulary().clone(),
             specials,
+            special_finder,
+            longest,
         })
     }
 
-    /// Recompute the library's actual full-input matches on every request. A
-    /// formerly recognized short token is not reused when appended bytes make a
-    /// longer token win. Ordinary added tokens also participate in this decision.
+    /// Every cut of the whole text (the library's matcher from position 0).
     pub fn boundaries(&self, text: &str) -> Vec<usize> {
+        self.scan(text, 0).cuts
+    }
+
+    /// Ends of every special-token occurrence before the end of the text, ascending: a superset
+    /// of the cuts, found without the library's matcher. Candidates for a cache lookup only.
+    pub fn candidates(&self, text: &str) -> Vec<usize> {
+        let mut ends: Vec<usize> = self
+            .special_finder
+            .find_overlapping_iter(text)
+            .map(|found| found.end())
+            .filter(|&end| end < text.len())
+            .collect();
+        ends.sort_unstable();
+        ends.dedup();
+        ends
+    }
+
+    /// The library's matcher on `text[from..]`. `from` must be 0 or a restart point from
+    /// `restart` for a prefix of `text`; then the result is the full scan's, from `from` on (1).
+    pub fn scan(&self, text: &str, from: usize) -> Scan {
         // Every added token is unnormalized, so normalization is irrelevant to
         // matching. Keeping the HF matcher avoids duplicating its tie breaking.
-        let split = self
-            .added
-            .extract_and_normalize(None::<&tokenizers::normalizers::NormalizerWrapper>, text);
-        split
-            .get_splits(OffsetReferential::Original, OffsetType::Byte)
-            .into_iter()
-            .filter_map(|(_, (start, end), tokens)| {
-                let tokens = tokens.as_ref()?;
-                if tokens.len() != 1 || end >= text.len() {
-                    return None;
+        let split = self.added.extract_and_normalize(
+            None::<&tokenizers::normalizers::NormalizerWrapper>,
+            &text[from..],
+        );
+        let mut matches = Vec::new();
+        let mut cuts = Vec::new();
+        for (_, (start, end), tokens) in split.get_splits(OffsetReferential::Original, OffsetType::Byte) {
+            let Some(tokens) = tokens.as_ref() else { continue };
+            let (start, end) = (start + from, end + from);
+            matches.push((start, end));
+            if tokens.len() != 1 || end >= text.len() {
+                continue;
+            }
+            if let Some(special) = self.specials.get(&tokens[0].id) {
+                if text.get(start..end) == Some(special.as_str()) {
+                    cuts.push(end);
                 }
-                let special = self.specials.get(&tokens[0].id)?;
-                (text.get(start..end) == Some(special.as_str())).then_some(end)
-            })
-            .collect()
+            }
+        }
+        Scan { from, matches, cuts }
+    }
+
+    /// A restart point for the key `text[..key_len]`, from a scan of `text` that covers it:
+    /// at most `key_len - L` and strictly inside no match, so it holds for every text that
+    /// starts with the key (module comment). 0 is always one.
+    pub fn restart(&self, text: &str, scan: &Scan, key_len: usize) -> usize {
+        let Some(mut r) = key_len.checked_sub(self.longest) else { return 0 };
+        if r < scan.from {
+            return 0;
+        }
+        while !text.is_char_boundary(r) {
+            r -= 1;
+        }
+        match scan.matches.iter().find(|&&(start, end)| start < r && r < end) {
+            Some(&(start, _)) => start,
+            None => r,
+        }
     }
 }
 
