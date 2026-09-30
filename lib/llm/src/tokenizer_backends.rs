@@ -236,7 +236,10 @@ impl RemoteTokenizer {
             on_miss,
             stats: TokStats::new(
                 "remote",
-                &["rtt_us", "service_us", "bytes_out", "bytes_in", "hits", "misses", "reused_tokens"],
+                &[
+                    "rtt_us", "service_us", "bytes_out", "bytes_in", "hits", "misses", "reused_tokens",
+                    "acct_bad",
+                ],
             ),
         })
     }
@@ -304,6 +307,16 @@ impl Encoder for RemoteTokenizer {
             _ => {}
         }
         let service_ns = h[6] as u64 | ((h[7] as u64) << 32);
+        // C23 over the wire: a hit reused some but not all IDs; a miss or bypass reused none.
+        let reused = h[3] as usize;
+        let acct_ok = match h[4] {
+            1 => reused > 0 && reused < ids.len(),
+            0 | 2 => reused == 0,
+            _ => false,
+        };
+        if !acct_ok {
+            tracing::warn!(lookup = h[4], reused, ids = ids.len(), "remote tokenizer accounting violates C23");
+        }
         self.stats.add(&[
             rtt.as_micros() as u64,
             service_ns / 1000,
@@ -312,6 +325,7 @@ impl Encoder for RemoteTokenizer {
             (h[4] == 1) as u64,
             (h[4] == 2) as u64,
             h[3] as u64,
+            !acct_ok as u64,
         ]);
         Ok(Encoding::Sp(ids))
     }
@@ -377,6 +391,74 @@ pub struct StreamRes {
 const _: () = assert!(std::mem::size_of::<StreamRes>() == 208);
 const _: () = assert!(std::mem::size_of::<TokPrefixStats>() == 96);
 
+/// `K1TokHostTiming` (k1_tok_session_client.h, host-timing ABI 1, 120 B; the builders' layout):
+/// the host side of one lane call. setup..finish sum exactly to `total_ns`; poll reads and sleeps
+/// are nested inside `completion_wait_ns`.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct HostTiming {
+    pub abi: u64,
+    pub total_ns: u64,
+    pub setup_ns: u64,
+    pub input_put_ns: u64,
+    pub request_publish_ns: u64,
+    pub completion_wait_ns: u64,
+    pub result_get_ns: u64,
+    pub result_validate_ns: u64,
+    pub output_get_ns: u64,
+    pub output_crc_ns: u64,
+    pub finish_ns: u64,
+    pub poll_count: u64,
+    pub sleep_count: u64,
+    pub poll_read_ns: u64,
+    pub sleep_ns: u64,
+}
+const _: () = assert!(std::mem::size_of::<HostTiming>() == 120);
+
+impl HostTiming {
+    fn phases(&self) -> [u64; 9] {
+        [
+            self.setup_ns,
+            self.input_put_ns,
+            self.request_publish_ns,
+            self.completion_wait_ns,
+            self.result_get_ns,
+            self.result_validate_ns,
+            self.output_get_ns,
+            self.output_crc_ns,
+            self.finish_ns,
+        ]
+    }
+    /// The builders' closure rules: exact sum, at least one poll, nested waits inside the wait phase.
+    fn valid(&self) -> bool {
+        let sum = self.phases().iter().try_fold(0u64, |a, &n| a.checked_add(n));
+        self.abi == 1
+            && sum == Some(self.total_ns)
+            && self.poll_count > 0
+            && self.sleep_count < self.poll_count
+            && self
+                .poll_read_ns
+                .checked_add(self.sleep_ns)
+                .is_some_and(|n| n <= self.completion_wait_ns)
+    }
+}
+
+/// C23: one request's cache accounting must add up (the builders check the same per request).
+/// `input` = prompt bytes, `total` = returned IDs.
+fn cache_accounting_ok(cached: bool, c: &TokPrefixStats, input: u64, total: u64) -> bool {
+    if !cached {
+        return c.hits == 0 && c.misses == 0 && c.reused_tokens == 0;
+    }
+    let hit = c.hits == 1 && c.misses == 0;
+    let miss = c.hits == 0 && c.misses == 1;
+    let bypass = c.hits == 0 && c.misses == 0;
+    c.reused_tokens + c.encoded_tokens == total
+        && c.input_bytes == input
+        && c.encoded_bytes <= input
+        && ((hit && c.reused_tokens > 0 && c.encoded_bytes < input)
+            || ((miss || bypass) && c.reused_tokens == 0 && c.encoded_bytes == input))
+}
+
 type OpenStream = unsafe extern "C" fn(usize, usize, usize) -> *mut libc::c_void;
 type StreamStart = unsafe extern "C" fn(*mut libc::c_void, u32) -> i32;
 type StreamEncode = unsafe extern "C" fn(
@@ -388,6 +470,7 @@ type StreamEncode = unsafe extern "C" fn(
     *mut u32,
     usize,
     *mut StreamRes,
+    *mut HostTiming,
 ) -> i32;
 
 const LANES: usize = 16;
@@ -438,7 +521,7 @@ fn open_cmm() -> Result<CmmClient> {
         };
         let open: OpenStream = std::mem::transmute(sym("k1ts_open_stream")?);
         let start: StreamStart = std::mem::transmute(sym("k1ts_stream_start")?);
-        let encode: StreamEncode = std::mem::transmute(sym("k1ts_stream_encode")?);
+        let encode: StreamEncode = std::mem::transmute(sym("k1ts_stream_encode_timed")?);
         let client = open(max_text, max_ids, cache_bytes);
         if client.is_null() {
             bail!(
@@ -488,13 +571,17 @@ impl CmmTokenizer {
             decoder,
             on_hit,
             on_miss,
-            // T3/T4: lane wait (queueing for a free lane), host round trip, ARM service parts, bytes.
+            // T3/T4: lane wait (queueing for a free lane), host round trip, ARM service parts, bytes;
+            // the host round trip by phase (HostTiming, ns); C23/timing violations (must stay 0).
             stats: TokStats::with_last(
                 if cached { "cmm-cached" } else { "cmm" },
                 &[
                     "lane_wait_us", "rtt_us", "arm_service_us", "arm_encode_us", "arm_encode_cpu_us",
                     "staging_us", "writeback_us", "bytes_in", "bytes_out", "hits", "misses",
-                    "reused_tokens",
+                    "reused_tokens", "h_total_ns", "h_setup_ns", "h_input_put_ns", "h_publish_ns",
+                    "h_wait_ns", "h_result_get_ns", "h_validate_ns", "h_output_get_ns", "h_crc_ns",
+                    "h_finish_ns", "h_polls", "h_sleeps", "h_poll_read_ns", "h_sleep_ns",
+                    "timing_bad", "acct_bad",
                 ],
                 &["cache_bytes", "entries", "evictions", "drops"],
             ),
@@ -524,6 +611,7 @@ impl Encoder for CmmTokenizer {
         };
         let t1 = Instant::now();
         let mut res = StreamRes::default();
+        let mut ht = HostTiming::default();
         let mut buf = c.bufs[lane as usize].lock().unwrap();
         let st = unsafe {
             (c.encode)(
@@ -535,6 +623,7 @@ impl Encoder for CmmTokenizer {
                 buf.as_mut_ptr(),
                 c.max_ids,
                 &mut res,
+                &mut ht,
             )
         };
         let t2 = Instant::now();
@@ -548,7 +637,7 @@ impl Encoder for CmmTokenizer {
         c.ready.notify_one();
         let Some(ids) = ids else {
             bail!(
-                "CMM lane {lane}: k1ts_stream_encode = {st}, ARM status {} (tokens {}, max_ids {})",
+                "CMM lane {lane}: k1ts_stream_encode_timed = {st}, ARM status {} (tokens {}, max_ids {})",
                 res.status,
                 res.total_tokens,
                 c.max_ids
@@ -561,6 +650,13 @@ impl Encoder for CmmTokenizer {
                 (self.on_miss)()
             }
         }
+        let timing_ok = ht.valid();
+        let acct_ok =
+            cache_accounting_ok(self.cached == 1, &res.cache, input.len() as u64, ids.len() as u64);
+        if !timing_ok || !acct_ok {
+            tracing::warn!(lane, timing_ok, acct_ok, ?ht, cache = ?res.cache, "CMM request telemetry violates C23/T3");
+        }
+        let p = ht.phases();
         self.stats.add_last(
             &[
                 (t1 - t0).as_micros() as u64,
@@ -575,6 +671,22 @@ impl Encoder for CmmTokenizer {
                 res.cache.hits,
                 res.cache.misses,
                 res.cache.reused_tokens,
+                ht.total_ns,
+                p[0],
+                p[1],
+                p[2],
+                p[3],
+                p[4],
+                p[5],
+                p[6],
+                p[7],
+                p[8],
+                ht.poll_count,
+                ht.sleep_count,
+                ht.poll_read_ns,
+                ht.sleep_ns,
+                !timing_ok as u64,
+                !acct_ok as u64,
             ],
             &[
                 res.cache.memory_bytes,
