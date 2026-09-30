@@ -690,6 +690,11 @@ pub fn make_engine<'p>(
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         if let Some(model_path) = args.model_path.clone() {
             let local_path = if model_path.exists() {
+                // RocketKV: record the local dir as source_path too. Without it the card's
+                // source_path falls back to the served name (--model-name), which is not a path,
+                // so register() rewrites every file to hf://<served-name>/ and the frontend
+                // tries to download a repo that does not exist (tok_dynamo.md TD12).
+                builder.source_path(std::path::absolute(&model_path).unwrap_or(model_path.clone()));
                 model_path
             } else {
                 // Mocker only needs tokenizer, not weights
