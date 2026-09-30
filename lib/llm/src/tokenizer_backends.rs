@@ -838,7 +838,13 @@ impl OffloadPool {
         let text = text.to_owned();
         let (tx, rx) = mpsc::sync_channel(1);
         let job: Job = Box::new(move || {
-            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tok.encode(&text)));
+            // Keep only the IDs (all the prompt path reads) and free the full encoding here, on the
+            // thread that allocated it. Returning it made the caller free ~16K token strings and
+            // offsets allocated by another thread: 89.5 vs 16.2 CPU-ms per 16K-token encode on gnr4
+            // (tok_dynamo.md Q17, `toksvc bench` c vs a).
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                tok.encode(&text).map(|e| Encoding::Sp(ids_of(e)))
+            }));
             let _ = tx.send(r);
         });
         self.tx
