@@ -575,6 +575,13 @@ fn open_cmm() -> Result<CmmClient> {
     // The stream ABI needs an arena even for D0 (uncached lanes never touch it).
     let cache_bytes = env_u64("DYN_TOKENIZER_CMM_CACHE_BYTES", 64 << 20) as usize;
     let dev = env_u64("DYN_TOKENIZER_CMM_DEV", 0) as u32; // 1 = loopback / development platform
+    // RocketKV CMM-Tok (baseten): the Arm lanes encode with basetenkenizer (stream-start flag bit 1)
+    let encoder = std::env::var("DYN_TOKENIZER_CMM_ENCODER").unwrap_or_else(|_| "hf".into());
+    let enc_flag: u32 = match encoder.as_str() {
+        "hf" | "" => 0,
+        "baseten" => 2,
+        other => bail!("DYN_TOKENIZER_CMM_ENCODER={other}: hf or baseten"),
+    };
     let cpath = std::ffi::CString::new(path.clone())?;
     unsafe {
         let h = libc::dlopen(cpath.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
@@ -600,12 +607,13 @@ fn open_cmm() -> Result<CmmClient> {
                  pool/transport not available (is the daemon running? K1_LOOPBACK for the loopback)"
             );
         }
-        let st = start(client, dev);
+        let flags = (dev & 1) | enc_flag;
+        let st = start(client, flags);
         if st != 0 {
-            bail!("k1ts_stream_start(flags {dev}) = {st} (loopback needs DYN_TOKENIZER_CMM_DEV=1)");
+            bail!("k1ts_stream_start(flags {flags}) = {st} (loopback needs DYN_TOKENIZER_CMM_DEV=1; -12 = basetenkenizer did not load)");
         }
         tracing::info!(
-            %path, max_text, max_ids, cache_bytes, dev,
+            %path, max_text, max_ids, cache_bytes, dev, %encoder,
             "CMM tokenizer: 16 ABI4 lanes started"
         );
         Ok(CmmClient {
