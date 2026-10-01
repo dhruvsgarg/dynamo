@@ -177,6 +177,7 @@ impl Scheduler {
             // in real time across passes.
             let scheduler_start = Instant::now();
             let mut deferred_commands = VecDeque::new();
+            let mut engine_stats = crate::engine_cpu::Stats::new(dp_rank);
 
             loop {
                 if !receive_until_schedulable(
@@ -204,7 +205,23 @@ impl Scheduler {
                 let zero_progress =
                     total_time.is_zero() && !pending.made_progress_since(&metrics_before);
                 publisher.publish_pass_start(&mut pending);
-                if total_time > std::time::Duration::ZERO {
+                // RocketKV A8: same work and wait as stock, only timed (engine_cpu.rs; off = stock)
+                if let (Some(ec), false) = (crate::engine_cpu::config(), controls_enabled) {
+                    let sched = iteration_start.elapsed();
+                    let deadline = iteration_start + total_time;
+                    let t_wait = Instant::now();
+                    if total_time > std::time::Duration::ZERO {
+                        if ec.spin_wait {
+                            let _ = tokio::task::spawn_blocking(move || crate::engine_cpu::spin_until(deadline)).await;
+                        } else {
+                            sleep_until_precise(deadline).await;
+                        }
+                    }
+                    if !zero_progress {
+                        let now = Instant::now();
+                        engine_stats.add(sched, now.saturating_duration_since(deadline), now - t_wait);
+                    }
+                } else if total_time > std::time::Duration::ZERO {
                     let deadline = iteration_start + total_time;
                     if controls_enabled {
                         if !wait_for_pass_boundary(

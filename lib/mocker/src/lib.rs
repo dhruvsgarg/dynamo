@@ -10,6 +10,7 @@
 pub mod cache;
 pub mod common;
 pub mod engine;
+pub mod engine_cpu;
 pub mod kv_manager;
 #[cfg(feature = "kvbm-offload")]
 pub mod kvbm_offload;
