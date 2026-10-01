@@ -258,6 +258,8 @@ mod tests {
                     input_sequence_hashes: vec![11, 22],
                 }),
                 finish_reason_metadata: None,
+                tokenize_ms: None,
+                tok: None,
             }),
             tool: None,
         }

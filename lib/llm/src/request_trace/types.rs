@@ -89,6 +89,48 @@ pub struct RequestTraceMetrics {
     pub replay: Option<RequestReplayMetrics>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finish_reason_metadata: Option<FinishReasonMetadata>,
+    /// RocketKV T13: the prompt encode's wall time (Dynamo's `tokenize` histogram value) and the tokenizer
+    /// backend's facts; absent unless the request was traced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokenize_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tok: Option<RequestTraceTok>,
+}
+
+/// RocketKV T13 (`tok_dynamo.md` §4.6): mirror of `tokenizer_backends::ReqTok`, see there.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RequestTraceTok {
+    pub lookup: u8,
+    pub ids: u32,
+    pub reused_tokens: u32,
+    pub queue_us: u64,
+    pub encode_us: u64,
+    pub cpu_us: u64,
+    pub handback_us: u64,
+    pub lane_wait_us: u64,
+    pub rtt_us: u64,
+    pub service_us: u64,
+    pub bytes_out: u64,
+    pub bytes_in: u64,
+}
+
+impl From<crate::tokenizer_backends::ReqTok> for RequestTraceTok {
+    fn from(t: crate::tokenizer_backends::ReqTok) -> Self {
+        Self {
+            lookup: t.lookup,
+            ids: t.ids,
+            reused_tokens: t.reused_tokens,
+            queue_us: t.queue_us,
+            encode_us: t.encode_us,
+            cpu_us: t.cpu_us,
+            handback_us: t.handback_us,
+            lane_wait_us: t.lane_wait_us,
+            rtt_us: t.rtt_us,
+            service_us: t.service_us,
+            bytes_out: t.bytes_out,
+            bytes_in: t.bytes_in,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -310,6 +352,8 @@ mod tests {
                     input_sequence_hashes: vec![11, 22],
                 }),
                 finish_reason_metadata: None,
+                tokenize_ms: None,
+                tok: None,
             }),
             tool: None,
         };

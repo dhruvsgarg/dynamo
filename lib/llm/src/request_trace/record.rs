@@ -48,34 +48,14 @@ pub(crate) fn emit_request_end(
     request_id: String,
     tracker: &RequestTracker,
     replay: RequestReplayMetrics,
+    x_request_id: Option<String>,
+    model: String,
 ) {
-    let request_received_ms = tracker.request_received_epoch_ms();
-    let event_time_unix_ms = tracker
-        .total_time_ms()
-        .map_or_else(unix_time_ms, |elapsed| {
-            request_received_ms.saturating_add(elapsed.max(0.0).round() as u64)
-        });
-
-    let request = RequestTraceMetrics {
-        request_id,
-        x_request_id: None,
-        model: None,
-        input_tokens: None,
-        output_tokens: Some(tracker.osl_tokens()),
-        cached_tokens: None,
-        request_received_ms: Some(request_received_ms),
-        prefill_wait_time_ms: None,
-        prefill_time_ms: None,
-        ttft_ms: None,
-        total_time_ms: None,
-        avg_itl_ms: None,
-        kv_hit_rate: None,
-        kv_transfer_estimated_latency_ms: None,
-        queue_depth: None,
-        worker: None,
-        replay: Some(replay),
-        finish_reason_metadata: None,
-    };
+    // RocketKV T13: the same timing fields as an agent_context row (stock filled only lengths and hashes)
+    let mut request = super::request_metrics(request_id, x_request_id, model, Some(tracker));
+    request.replay = Some(replay);
+    sanitize_request(&mut request);
+    let event_time_unix_ms = event_time_unix_ms_from_request(&request);
 
     publish(RequestTraceRecord {
         schema: RequestTraceSchema::V1,
@@ -166,6 +146,8 @@ mod tests {
                 input_length: 3,
                 input_sequence_hashes: vec![11, 22],
             },
+            Some("aiperf-1".to_string()),
+            "m".to_string(),
         );
 
         let record = loop {
@@ -181,6 +163,8 @@ mod tests {
         let request = record.request.as_ref().expect("request payload");
         assert_eq!(request.request_id, "req-1");
         assert_eq!(request.output_tokens, Some(7));
+        assert_eq!(request.x_request_id.as_deref(), Some("aiperf-1"));
+        assert!(request.total_time_ms.is_some(), "T13: timing filled without agent_context");
         assert_eq!(
             request.request_received_ms,
             Some(tracker.request_received_epoch_ms())

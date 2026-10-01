@@ -155,6 +155,9 @@ pub struct RequestTracker {
     /// How long it took to tokenize the input
     tokenize_latency: OnceLock<Duration>,
 
+    /// RocketKV T13: the tokenizer backend's facts for this request's prompt encode
+    rocketkv_tok: OnceLock<crate::tokenizer_backends::ReqTok>,
+
     /// Accumulated time spent detokenizing output tokens for this request (nanoseconds)
     detokenize_total_ns: AtomicU64,
 
@@ -232,6 +235,7 @@ impl RequestTracker {
             phase: Mutex::new(RequestPhase::Aggregated),
             phase_semaphore: Arc::new(Semaphore::new(1)),
             tokenize_latency: OnceLock::new(),
+            rocketkv_tok: OnceLock::new(),
             detokenize_total_ns: AtomicU64::new(0),
             detokenize_count: AtomicU64::new(0),
             router_queue_depth: OnceLock::new(),
@@ -470,6 +474,14 @@ impl RequestTracker {
 
     pub fn tokenize_latency(&self) -> Option<Duration> {
         self.tokenize_latency.get().copied()
+    }
+
+    pub fn record_rocketkv_tok(&self, t: crate::tokenizer_backends::ReqTok) {
+        let _ = self.rocketkv_tok.set(t);
+    }
+
+    pub fn rocketkv_tok(&self) -> Option<crate::tokenizer_backends::ReqTok> {
+        self.rocketkv_tok.get().copied()
     }
 
     pub fn record_detokenize_latency(&self, l: Duration) {

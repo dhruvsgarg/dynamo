@@ -1172,11 +1172,14 @@ impl ModelDeploymentCard {
                     Arc::new(wrap_hf(hf))
                 };
 
+                // RocketKV T13: the observers also mark this thread's encode as a hit or a miss (v1 included)
                 let on_hit: crate::tokenizer_backends::CacheEventFn = Arc::new(|| {
                     dynamo_runtime::metrics::frontend_perf::TOKENIZER_CACHE_HITS_TOTAL.inc();
+                    crate::tokenizer_backends::note_lookup(true);
                 });
                 let on_miss: crate::tokenizer_backends::CacheEventFn = Arc::new(|| {
                     dynamo_runtime::metrics::frontend_perf::TOKENIZER_CACHE_MISSES_TOTAL.inc();
+                    crate::tokenizer_backends::note_lookup(false);
                 });
                 use crate::tokenizer_backends::EncoderKind;
                 if encoder != EncoderKind::Host && cache_enabled {

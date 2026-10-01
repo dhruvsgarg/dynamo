@@ -1994,8 +1994,10 @@ impl OpenAIPreprocessor {
             Some(pool) => pool.encode(&self.tokenizer, prompt.as_ref())?,
             None => crate::tokenizer_backends::encode_inline(&self.tokenizer, prompt.as_ref())?,
         };
+        let tok = crate::tokenizer_backends::take_req_tok(); // RocketKV T13
         if let Some(t) = tracker {
             t.record_tokenize_latency(encode_start.elapsed());
+            t.record_rocketkv_tok(tok);
         }
         Ok(encoding)
     }

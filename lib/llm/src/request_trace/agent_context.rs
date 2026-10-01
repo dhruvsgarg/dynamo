@@ -229,6 +229,10 @@ pub(crate) fn request_metrics(
         worker,
         replay: None,
         finish_reason_metadata: None,
+        tokenize_ms: tracker
+            .and_then(RequestTracker::tokenize_latency)
+            .map(|d| d.as_secs_f64() * 1000.0),
+        tok: tracker.and_then(RequestTracker::rocketkv_tok).map(Into::into),
     }
 }
 

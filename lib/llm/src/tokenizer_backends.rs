@@ -76,6 +76,53 @@ fn ids_of(e: Encoding) -> Vec<TokenIdType> {
     }
 }
 
+/// T13 (RocketKV `tok_dynamo.md` §4.6): one prompt encode's tokenizer facts, carried into Dynamo's per-request
+/// trace record (`DYN_REQUEST_TRACE`). The backend fills it on the thread that encodes (cache observers included);
+/// the offload pool hands it back with the IDs; `take_req_tok` reads it on the caller after the encode returns.
+/// Nothing here does I/O: the record is published by Dynamo's trace bus at request end.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ReqTok {
+    /// 0 = no cache or bypass, 1 = hit, 2 = miss.
+    pub lookup: u8,
+    /// IDs returned; IDs taken from the cache (v2, Tokenizer server, CMM-Tok; v1 does not say).
+    pub ids: u32,
+    pub reused_tokens: u32,
+    /// Offload pool: wait for a thread, the encode call (wall, thread CPU), hand-back to the caller.
+    pub queue_us: u64,
+    pub encode_us: u64,
+    pub cpu_us: u64,
+    pub handback_us: u64,
+    /// CMM-Tok: wait for a free lane, host round trip, ARM service. Tokenizer server: round trip, service.
+    pub lane_wait_us: u64,
+    pub rtt_us: u64,
+    pub service_us: u64,
+    /// Bytes moved off the frontend for this encode: CXL (CMM-Tok) or TCP (Tokenizer server).
+    pub bytes_out: u64,
+    pub bytes_in: u64,
+}
+
+thread_local! {
+    static REQ_TOK: std::cell::Cell<ReqTok> = std::cell::Cell::new(ReqTok::default());
+}
+
+fn note_tok(f: impl FnOnce(&mut ReqTok)) {
+    REQ_TOK.with(|c| {
+        let mut r = c.get();
+        f(&mut r);
+        c.set(r);
+    });
+}
+
+/// Called by Dynamo's cache observers (v1 included): the lookup outcome of the encode on this thread.
+pub fn note_lookup(hit: bool) {
+    note_tok(|r| r.lookup = if hit { 1 } else { 2 });
+}
+
+/// The facts of the last encode on this thread, reset for the next one.
+pub fn take_req_tok() -> ReqTok {
+    REQ_TOK.with(|c| c.replace(ReqTok::default()))
+}
+
 /// Running per-backend telemetry, logged as one `tokstats` line every `DYN_TOKENIZER_STATS_EVERY`
 /// requests (default 16). `tok/dyn/summarize.py` reads the last line of the run. One request's update and the
 /// periodic line are serialised, so a line never mixes a half-added request into its sums (E0.8: n=32 carried 33
@@ -185,6 +232,10 @@ impl Encoder for CachedTokenizerV2 {
             Lookup::Miss => (self.on_miss)(),
             Lookup::Bypass => {}
         }
+        note_tok(|r| {
+            r.ids = ids.len() as u32;
+            r.reused_tokens = out.reused_tokens as u32;
+        });
         let c = self.cache.stats(false);
         self.stats.add_last(
             &[
@@ -329,6 +380,14 @@ impl Encoder for RemoteTokenizer {
         if !acct_ok {
             tracing::warn!(lookup = h[4], reused, ids = ids.len(), "remote tokenizer accounting violates C23");
         }
+        note_tok(|r| {
+            r.ids = ids.len() as u32;
+            r.reused_tokens = reused as u32;
+            r.rtt_us = rtt.as_micros() as u64;
+            r.service_us = service_ns / 1000;
+            r.bytes_out = 8 + input.len() as u64;
+            r.bytes_in = 32 + 4 * ids.len() as u64;
+        });
         self.stats.add(&[
             rtt.as_micros() as u64,
             service_ns / 1000,
@@ -668,6 +727,15 @@ impl Encoder for CmmTokenizer {
         if !timing_ok || !acct_ok {
             tracing::warn!(lane, timing_ok, acct_ok, ?ht, cache = ?res.cache, "CMM request telemetry violates C23/T3");
         }
+        note_tok(|r| {
+            r.ids = ids.len() as u32;
+            r.reused_tokens = res.cache.reused_tokens as u32;
+            r.lane_wait_us = (t1 - t0).as_micros() as u64;
+            r.rtt_us = (t2 - t1).as_micros() as u64;
+            r.service_us = (res.batch_end_ns - res.batch_start_ns) / 1000;
+            r.bytes_out = input.len() as u64;
+            r.bytes_in = 4 * ids.len() as u64;
+        });
         let p = ht.phases();
         self.stats.add_last(
             &[
@@ -930,9 +998,17 @@ fn pin_idle(_cpu: usize) -> Result<()> {
 pub fn encode_inline(tokenizer: &Arc<dyn Tokenizer>, text: &str) -> Result<Encoding> {
     static STATS: OnceLock<TokStats> = OnceLock::new();
     let stats = STATS.get_or_init(|| encode_stats("inline"));
+    take_req_tok();
     let (t0, u0) = (Instant::now(), thread_usage());
     let e = tokenizer.encode(text);
     let (wall, u1) = (t0.elapsed(), thread_usage());
+    note_tok(|r| {
+        r.encode_us = wall.as_micros() as u64;
+        r.cpu_us = (u1.0 - u0.0) / 1000;
+        if r.ids == 0 {
+            r.ids = e.as_ref().map_or(0, |e| e.token_ids().len() as u32);
+        }
+    });
     stats.add(&[0, wall.as_micros() as u64, (u1.0 - u0.0) / 1000, (u1.1 - u0.1) / 1000, u1.2 - u0.2, 0, 0]);
     e
 }
@@ -985,11 +1061,16 @@ impl OffloadPool {
             // costs ~80-96 CPU-ms on any thread but the bench's main one (16), stock inline too
             // (tok_dynamo.md Q17, E0.9d).
             let started = Instant::now();
+            take_req_tok();
             let u0 = thread_usage();
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tok.encode(&text)));
             let (encoded, u1) = (Instant::now(), thread_usage());
             let r = r.map(|e| e.map(|e| if full { e } else { Encoding::Sp(ids_of(e)) }));
             let freed = Instant::now();
+            let mut req = take_req_tok();
+            if req.ids == 0 {
+                req.ids = r.as_ref().ok().and_then(|e| e.as_ref().ok()).map_or(0, |e| e.token_ids().len() as u32);
+            }
             let times = [
                 (started - submitted).as_micros() as u64,
                 (encoded - started).as_micros() as u64,
@@ -998,7 +1079,7 @@ impl OffloadPool {
                 u1.2 - u0.2,
                 (freed - encoded).as_micros() as u64,
             ];
-            let _ = tx.send((r, times, freed));
+            let _ = tx.send((r, times, freed, req));
         });
         self.tx
             .lock()
@@ -1013,14 +1094,65 @@ impl OffloadPool {
             _ => wait(),
         };
         match r {
-            Ok((r, t, freed)) => {
-                self.stats.add(&[t[0], t[1], t[2], t[3], t[4], t[5], freed.elapsed().as_micros() as u64]);
+            Ok((r, t, freed, mut req)) => {
+                let handback = freed.elapsed().as_micros() as u64;
+                self.stats.add(&[t[0], t[1], t[2], t[3], t[4], t[5], handback]);
+                (req.queue_us, req.encode_us, req.cpu_us, req.handback_us) = (t[0], t[1], t[2], handback);
+                REQ_TOK.with(|c| c.set(req));
                 match r {
                     Ok(result) => result,
                     Err(panic) => std::panic::resume_unwind(panic),
                 }
             }
             Err(_) => bail!("tokenizer pool dropped the request"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod t13_tests {
+    use super::*;
+
+    /// Encodes to one ID per byte and reports a hit, as a cache observer would.
+    struct Fake;
+    impl Encoder for Fake {
+        fn encode(&self, input: &str) -> Result<Encoding> {
+            note_lookup(true);
+            note_tok(|r| r.reused_tokens = 3);
+            Ok(Encoding::Sp(input.bytes().map(u32::from).collect()))
+        }
+        fn encode_batch(&self, inputs: &[&str]) -> Result<Vec<Encoding>> {
+            inputs.iter().map(|i| self.encode(i)).collect()
+        }
+    }
+    impl Decoder for Fake {
+        fn decode(&self, _: &[TokenIdType], _: bool) -> Result<DecodeResult> {
+            Ok(DecodeResult::Complete(String::new()))
+        }
+    }
+    impl Tokenizer for Fake {}
+
+    #[test]
+    fn inline_encode_leaves_its_facts_for_the_caller() {
+        let tok: Arc<dyn Tokenizer> = Arc::new(Fake);
+        note_lookup(false); // a previous request's leftover must not leak in
+        encode_inline(&tok, "hello").unwrap();
+        let r = take_req_tok();
+        assert_eq!((r.lookup, r.ids, r.reused_tokens), (1, 5, 3));
+        assert_eq!(take_req_tok(), ReqTok::default(), "taking resets");
+    }
+
+    #[test]
+    fn pool_hands_the_facts_back_to_the_caller_thread() {
+        // SAFETY: test-only, set before the pool's first use in this process
+        unsafe { std::env::set_var("DYN_TOKENIZER_OFFLOAD", "1") };
+        unsafe { std::env::set_var("DYN_TOKENIZER_THREADS", "2") };
+        let pool = offload_pool().expect("pool");
+        let tok: Arc<dyn Tokenizer> = Arc::new(Fake);
+        for text in ["abc", "abcdefgh"] {
+            pool.encode(&tok, text).unwrap();
+            let r = take_req_tok();
+            assert_eq!((r.lookup, r.ids, r.reused_tokens), (1, text.len() as u32, 3));
         }
     }
 }

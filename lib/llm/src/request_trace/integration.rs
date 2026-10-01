@@ -20,6 +20,10 @@ use crate::request_trace::{
 struct RequestTraceRequestEndState {
     request_tracker: Arc<RequestTracker>,
     replay_metrics: Arc<RequestReplayMetrics>,
+    /// RocketKV T13: the client's X-Request-ID (aiperf sends one per request) and the model, so a row without
+    /// agent_context carries the same timing fields and joins the client's record.
+    x_request_id: Option<String>,
+    model: String,
 }
 
 pub(crate) struct RequestEndTraceState {
@@ -117,9 +121,19 @@ fn build_request_end_trace_state_for_policy(
         .then(|| super::build_agent_context_trace_state(common_request, tracker, context))
         .flatten();
 
+    let x_request_id = dynamo_runtime::logging::get_distributed_tracing_context()
+        .and_then(|c| c.x_request_id)
+        .or_else(|| {
+            context
+                .get::<String>(super::X_REQUEST_ID_CONTEXT_KEY)
+                .ok()
+                .map(|v| v.as_ref().clone())
+        });
     let request = RequestTraceRequestEndState {
         request_tracker,
         replay_metrics,
+        x_request_id,
+        model: common_request.model.clone(),
     };
 
     Some(RequestEndTraceState { agent, request })
@@ -162,6 +176,8 @@ where
                 request_id.clone(),
                 &request_state.request_tracker,
                 super::into_owned_replay_metrics(request_state.replay_metrics),
+                request_state.x_request_id,
+                request_state.model,
             );
         }
     });
@@ -327,6 +343,8 @@ mod tests {
                     input_length: 2,
                     input_sequence_hashes: vec![11],
                 }),
+                x_request_id: None,
+                model: "test-model".to_string(),
             },
         };
         let stream = TrackerDropStream {
@@ -383,6 +401,8 @@ mod tests {
                     input_length: 2,
                     input_sequence_hashes: vec![11],
                 }),
+                x_request_id: None,
+                model: "test-model".to_string(),
             },
         };
         let stream = TrackerDropStream {
