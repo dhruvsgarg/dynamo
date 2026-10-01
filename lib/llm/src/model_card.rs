@@ -1201,11 +1201,13 @@ impl ModelDeploymentCard {
                             specials = specials.len(),
                             "wrapping tokenizer in L1 prefix cache",
                         );
-                        Arc::new(
+                        let l1 = Arc::new(
                             crate::tokenizers::CachedTokenizer::new(raw, specials, cache_bytes)
                                 .with_extend(cache_extend)
                                 .with_observer(on_hit, on_miss),
-                        )
+                        );
+                        crate::tokenizer_backends::sample_v1_cache(l1.clone()); // T7, off the request path
+                        l1
                     }
                     EncoderKind::Host => raw,
                     EncoderKind::Remote => {

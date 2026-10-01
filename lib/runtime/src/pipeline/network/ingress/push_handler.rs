@@ -547,12 +547,20 @@ where
             }
         });
 
+        let payload_len = payload.len();
         let ParsedRequest {
             request,
             response_connection_info,
             frontend_send_ts_ns,
             payload_codec,
         } = self.parse_and_build_request(payload).await?;
+        if crate::pipeline::network::reqplane_stats::on() {
+            // RocketKV T8: bytes and send -> receive per request (frontend stamps only with the same flag)
+            crate::pipeline::network::reqplane_stats::received(
+                payload_len,
+                frontend_send_ts_ns.map(|t1| t2_wallclock_ns.saturating_sub(t1)),
+            );
+        }
 
         // Compute network transit time (T2 - T1) using cross-process wall-clock timestamps
         if let Some(t1_ns) = frontend_send_ts_ns {

@@ -166,7 +166,7 @@ where
         payload_codec,
         connection_info: recv_conn_info,
         metadata: context.metadata().clone(),
-        frontend_send_ts_ns: None,
+        frontend_send_ts_ns: crate::pipeline::network::reqplane_stats::on().then(crate::pipeline::network::reqplane_stats::now_ns), // RocketKV T8
         request_stream_connection_info: send_conn_info,
     };
 
@@ -198,6 +198,9 @@ where
 
     let codec = TwoPartCodec::default();
     let buffer = codec.encode_message(msg)?;
+    if crate::pipeline::network::reqplane_stats::on() {
+        crate::pipeline::network::reqplane_stats::sent(buffer.len());
+    }
     Ok(buffer)
 }
 

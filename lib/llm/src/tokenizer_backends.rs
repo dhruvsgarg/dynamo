@@ -10,6 +10,7 @@
 //! | `DYN_TOKENIZER_ENCODER=cmm` + `DYN_TOKENIZER_CMM_LIBRARY=<.so>` | [`CmmTokenizer`]: ABI4 lanes on the CMM | D0, D (`DYN_TOKENIZER_CMM_CACHE=1`) |
 //! | `DYN_TOKENIZER_PARITY=1` | [`ParityTokenizer`]: shadow uncached HF encode per request, off the timed path (C1) | diagnostic |
 //! | `DYN_TOKENIZER_OFFLOAD=1` | [`encode_off_runtime`]: prompt encode on `DYN_TOKENIZER_THREADS` named threads, not a tokio worker (A9) | every mode |
+//! | `DYN_TOKENIZER_CACHE_SAMPLE_MS` | [`sample_v1_cache`]: Dynamo's v1 cache entries/bytes logged at this period (default 1000, 0 = off; T7) | Dynamo modes |
 //! | `DYN_TOKENIZER_WARM=1` | [`start_warmers`]: a `SCHED_IDLE` spinner pinned to each of the process's CPUs keeps their clock up between requests (Q17) | every mode, an A/B |
 //!
 //! Decode always stays on the host HF tokenizer. None of this changes stock behaviour when unset.
@@ -165,9 +166,10 @@ impl CachedTokenizerV2 {
             cache,
             on_hit,
             on_miss,
-            stats: TokStats::new(
+            stats: TokStats::with_last(
                 "v2",
                 &["hits", "misses", "reused_tokens", "encoded_tokens", "encoded_bytes"],
+                &["entries", "cache_bytes", "evictions", "drops"],   // T7, Moka's counts without a sync
             ),
         }
     }
@@ -183,13 +185,17 @@ impl Encoder for CachedTokenizerV2 {
             Lookup::Miss => (self.on_miss)(),
             Lookup::Bypass => {}
         }
-        self.stats.add(&[
-            (out.lookup == Lookup::Hit) as u64,
-            (out.lookup == Lookup::Miss) as u64,
-            out.reused_tokens as u64,
-            (ids.len() - out.reused_tokens) as u64,
-            out.encoded_bytes as u64,
-        ]);
+        let c = self.cache.stats(false);
+        self.stats.add_last(
+            &[
+                (out.lookup == Lookup::Hit) as u64,
+                (out.lookup == Lookup::Miss) as u64,
+                out.reused_tokens as u64,
+                (ids.len() - out.reused_tokens) as u64,
+                out.encoded_bytes as u64,
+            ],
+            &[c.entries, c.weighted_bytes, c.evictions, c.admission_drops],
+        );
         Ok(Encoding::Sp(ids))
     }
     fn encode_batch(&self, inputs: &[&str]) -> Result<Vec<Encoding>> {
@@ -821,6 +827,38 @@ pub struct OffloadPool {
     /// `DYN_TOKENIZER_POOL_FULL=1`: hand the full encoding back (the pre-Q17 behaviour), an A/B only.
     full: bool,
     stats: Arc<TokStats>,
+}
+
+/// T7 for Dynamo's own (v1) token cache: its only snapshot runs Moka's pending maintenance, so it is never read on the
+/// request path. One `dyn-cache-stats` thread logs `tokstats v1 n= hits= misses= entries= cache_bytes=` every
+/// `DYN_TOKENIZER_CACHE_SAMPLE_MS` (default 1000; 0 = off) while requests move it. v1 counts no evictions or reused tokens.
+pub fn sample_v1_cache(cache: Arc<crate::tokenizers::CachedTokenizer>) {
+    let ms = env_u64("DYN_TOKENIZER_CACHE_SAMPLE_MS", 1000);
+    if ms == 0 {
+        return;
+    }
+    std::thread::Builder::new()
+        .name("dyn-cache-stats".into())
+        .spawn(move || {
+            let mut seen = (u64::MAX, u64::MAX);
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+                let s = cache.cache_stats();
+                if (s.hits, s.misses) == seen {
+                    continue;
+                }
+                seen = (s.hits, s.misses);
+                tracing::info!(
+                    "tokstats v1 n={} hits={} misses={} entries={} cache_bytes={}",
+                    s.hits + s.misses,
+                    s.hits,
+                    s.misses,
+                    s.entries,
+                    s.memory_bytes
+                );
+            }
+        })
+        .expect("spawn cache-stats thread");
 }
 
 /// `DYN_TOKENIZER_WARM=1` (tok_dynamo.md Q17): one `dyn-warm-<cpu>` thread pinned to each CPU this process may run on,
