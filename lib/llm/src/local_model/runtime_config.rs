@@ -53,6 +53,8 @@ pub const ENV_TOKENIZER_BACKEND: &str = "DYN_TOKENIZER";
 pub enum TokenizerBackend {
     Default,
     Fastokens,
+    /// RocketKV backport of Dynamo v1.5's `basetenkenizer` backend (encode and decode by the crate)
+    Basetenkenizer,
 }
 
 impl TokenizerBackend {
@@ -60,6 +62,7 @@ impl TokenizerBackend {
         match self {
             Self::Default => "default",
             Self::Fastokens => "fastokens",
+            Self::Basetenkenizer => "basetenkenizer",
         }
     }
 
@@ -70,11 +73,12 @@ impl TokenizerBackend {
     pub fn from_env_or_default() -> Self {
         match std::env::var(ENV_TOKENIZER_BACKEND) {
             Ok(v) if v == "fastokens" => Self::Fastokens,
+            Ok(v) if v == "basetenkenizer" => Self::Basetenkenizer,
             Ok(v) if v == "default" || v.is_empty() => Self::Default,
             Ok(v) => {
                 tracing::warn!(
                     value = %v,
-                    "Unrecognized DYN_TOKENIZER value, expected 'fastokens' or 'default'; falling back to default"
+                    "Unrecognized DYN_TOKENIZER value, expected 'default', 'fastokens', or 'basetenkenizer'; falling back to default"
                 );
                 Self::Default
             }
@@ -90,8 +94,9 @@ impl FromStr for TokenizerBackend {
         match value {
             "default" => Ok(Self::Default),
             "fastokens" => Ok(Self::Fastokens),
+            "basetenkenizer" => Ok(Self::Basetenkenizer),
             _ => Err(format!(
-                "invalid tokenizer backend '{value}' (expected 'default' or 'fastokens')"
+                "invalid tokenizer backend '{value}' (expected 'default', 'fastokens', or 'basetenkenizer')"
             )),
         }
     }

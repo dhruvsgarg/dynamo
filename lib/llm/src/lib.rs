@@ -7,6 +7,7 @@
 //! distributed LLM inference solutions.
 
 pub mod backend;
+pub mod baseten_tokenizer;
 pub mod common;
 pub mod discovery;
 pub mod endpoint_type;

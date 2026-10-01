@@ -1074,10 +1074,9 @@ impl ModelDeploymentCard {
     ///   per-turn tokenization cost flat instead of growing with history. Set to `0` to
     ///   fall back to the original hit-without-insert behavior.
     pub fn tokenizer(&self) -> anyhow::Result<crate::tokenizers::Tokenizer> {
-        let use_fast = self
-            .runtime_config
-            .effective_tokenizer_backend()
-            .is_fastokens();
+        let backend = self.runtime_config.effective_tokenizer_backend();
+        let use_fast = backend.is_fastokens();
+        let use_baseten = backend == crate::local_model::runtime_config::TokenizerBackend::Basetenkenizer;
 
         let cache_enabled = matches!(
             std::env::var("DYN_TOKENIZER_CACHE").ok().as_deref(),
@@ -1146,7 +1145,20 @@ impl ModelDeploymentCard {
                     |hf: HfTokenizer| crate::tokenizers::HuggingFaceTokenizer::from_tokenizer(hf);
 
                 // Pick the inner backend.
-                let raw: Arc<dyn crate::tokenizers::traits::Tokenizer> = if use_fast {
+                let raw: Arc<dyn crate::tokenizers::traits::Tokenizer> = if use_baseten {
+                    // RocketKV: Dynamo v1.5's basetenkenizer backend (backported; same selection and fallback)
+                    match p.to_str().map(crate::baseten_tokenizer::BasetenTokenizer::from_file) {
+                        Some(Ok(bt)) => {
+                            tracing::info!("Using basetenkenizer tokenizer backend");
+                            Arc::new(bt)
+                        }
+                        Some(Err(e)) => {
+                            tracing::warn!(%e, "Failed to load basetenkenizer, falling back to HuggingFace");
+                            Arc::new(wrap_hf(hf))
+                        }
+                        None => Arc::new(wrap_hf(hf)),
+                    }
+                } else if use_fast {
                     if let Some(path_str) = p.to_str() {
                         match crate::tokenizers::FastTokenizer::from_file(path_str) {
                             Ok(fast) => {

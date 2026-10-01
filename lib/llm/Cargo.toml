@@ -64,6 +64,7 @@ dynamo-mocker = { workspace = true }
 dynamo-rl = { workspace = true }
 dynamo-runtime = { workspace = true }
 dynamo-tokenizers = { workspace = true }
+basetenkenizer = { workspace = true }   # RocketKV: v1.5's baseten backend, backported
 dynamo-renderer = { workspace = true }
 dynamo-tokens = { workspace = true }
 
