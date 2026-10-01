@@ -1125,6 +1125,7 @@ impl ModelDeploymentCard {
                 }
                 // RocketKV (tokenizer_backends.rs): encoder placement, cache policy, parity.
                 let encoder = crate::tokenizer_backends::encoder_kind()?;
+                crate::tokenizer_backends::start_warmers();
                 let policy_v2 = cache_enabled && crate::tokenizer_backends::cache_policy_v2()?;
                 let parity_ref = matches!(
                     std::env::var("DYN_TOKENIZER_PARITY").ok().as_deref(),

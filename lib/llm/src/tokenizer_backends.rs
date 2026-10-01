@@ -10,6 +10,7 @@
 //! | `DYN_TOKENIZER_ENCODER=cmm` + `DYN_TOKENIZER_CMM_LIBRARY=<.so>` | [`CmmTokenizer`]: ABI4 lanes on the CMM | D0, D (`DYN_TOKENIZER_CMM_CACHE=1`) |
 //! | `DYN_TOKENIZER_PARITY=1` | [`ParityTokenizer`]: shadow uncached HF encode per request, off the timed path (C1) | diagnostic |
 //! | `DYN_TOKENIZER_OFFLOAD=1` | [`encode_off_runtime`]: prompt encode on `DYN_TOKENIZER_THREADS` named threads, not a tokio worker (A9) | every mode |
+//! | `DYN_TOKENIZER_WARM=1` | [`start_warmers`]: a `SCHED_IDLE` spinner pinned to each of the process's CPUs keeps their clock up between requests (Q17) | every mode, an A/B |
 //!
 //! Decode always stays on the host HF tokenizer. None of this changes stock behaviour when unset.
 
@@ -820,6 +821,70 @@ pub struct OffloadPool {
     /// `DYN_TOKENIZER_POOL_FULL=1`: hand the full encoding back (the pre-Q17 behaviour), an A/B only.
     full: bool,
     stats: Arc<TokStats>,
+}
+
+/// `DYN_TOKENIZER_WARM=1` (tok_dynamo.md Q17): one `dyn-warm-<cpu>` thread pinned to each CPU this process may run on,
+/// spinning under `SCHED_IDLE` (no privilege needed). Such a thread runs only when nothing else on its core is runnable and
+/// is preempted at once when something wakes there, so it takes ~no time from the encode or the runtime, but the core never
+/// idles and its clock stays up (gnr4's cores clock down while idle and ramp per burst; a `performance` governor needs
+/// admin). Their CPU is reported apart (`summarize.py`). Returns how many started; 0 when unset or not Linux.
+pub fn start_warmers() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        if !env_on("DYN_TOKENIZER_WARM") {
+            return 0;
+        }
+        let cpus = allowed_cpus();
+        for &cpu in &cpus {
+            std::thread::Builder::new()
+                .name(format!("dyn-warm-{cpu}"))
+                .spawn(move || {
+                    if let Err(e) = pin_idle(cpu) {
+                        tracing::warn!(cpu, "warmer: {e}; this core is not warmed");
+                        return;
+                    }
+                    loop {
+                        std::hint::spin_loop();
+                    }
+                })
+                .expect("spawn warmer thread");
+        }
+        tracing::info!(cpus = ?cpus, "warming cores: a SCHED_IDLE spinner on each (DYN_TOKENIZER_WARM=1)");
+        cpus.len()
+    })
+}
+
+/// The CPUs this process may run on (its affinity, e.g. from `taskset`).
+#[cfg(target_os = "linux")]
+fn allowed_cpus() -> Vec<usize> {
+    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    if unsafe { libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) } != 0 {
+        return Vec::new();
+    }
+    (0..libc::CPU_SETSIZE as usize).filter(|&c| unsafe { libc::CPU_ISSET(c, &set) }).collect()
+}
+#[cfg(not(target_os = "linux"))]
+fn allowed_cpus() -> Vec<usize> {
+    Vec::new()
+}
+
+/// Pin the calling thread to `cpu` and drop it to `SCHED_IDLE`.
+#[cfg(target_os = "linux")]
+fn pin_idle(cpu: usize) -> Result<()> {
+    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    unsafe { libc::CPU_SET(cpu, &mut set) };
+    if unsafe { libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) } != 0 {
+        bail!("sched_setaffinity({cpu}): {}", std::io::Error::last_os_error());
+    }
+    let param = libc::sched_param { sched_priority: 0 };
+    if unsafe { libc::sched_setscheduler(0, libc::SCHED_IDLE, &param) } != 0 {
+        bail!("sched_setscheduler(SCHED_IDLE): {}", std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+#[cfg(not(target_os = "linux"))]
+fn pin_idle(_cpu: usize) -> Result<()> {
+    bail!("not Linux")
 }
 
 /// The stock path (`DYN_TOKENIZER_OFFLOAD=0`): encode on the calling tokio worker, measured the
