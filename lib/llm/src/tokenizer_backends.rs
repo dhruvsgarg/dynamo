@@ -877,9 +877,10 @@ impl OffloadPool {
         let submitted = Instant::now();
         let job: Job = Box::new(move || {
             // Keep only the IDs (all the prompt path reads) and free the full encoding here, on the
-            // thread that allocated it. Returning it made the caller free ~16K token strings and
-            // offsets allocated by another thread: 89.5 vs 16.2 CPU-ms per 16K-token encode on gnr4
-            // (tok_dynamo.md Q17, `toksvc bench` c vs a).
+            // thread that allocated it: freeing ~16K token strings and offsets on the caller cost it
+            // ~10 ms of system time per 16K-token encode on gnr4. Not the Q17 gap: the encode itself
+            // costs ~80-96 CPU-ms on any thread but the bench's main one (16), stock inline too
+            // (tok_dynamo.md Q17, E0.9d).
             let started = Instant::now();
             let u0 = thread_usage();
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tok.encode(&text)));
