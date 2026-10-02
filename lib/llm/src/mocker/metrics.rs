@@ -170,13 +170,21 @@ impl NativeMockerMetrics {
         is_prefill: bool,
         start: Instant,
     ) -> NativeRequestTiming {
-        if is_prefill {
-            return NativeRequestTiming::disabled(start);
-        }
-
         let Some(model_name) = self.ensure_model_name(model_name).await else {
             return NativeRequestTiming::disabled(start);
         };
+
+        // RocketKV T16: a prefill worker binds the model_name label too, so its scheduler gauges (running, waiting,
+        // KV use) are exported; stock bound it on decode requests only, leaving a prefill /metrics without them.
+        // Request histograms stay decode-only, as stock.
+        if is_prefill {
+            let mut state = self
+                .state
+                .lock()
+                .expect("native mocker metrics lock poisoned");
+            self.bind_handles_locked(&mut state, &model_name);
+            return NativeRequestTiming::disabled(start);
+        }
 
         let handles = {
             let mut state = self
@@ -900,6 +908,45 @@ mod tests {
         let text = registry.prometheus_expfmt_combined().unwrap();
         assert!(!text.contains("dynamo_component_vllm"));
         assert!(!text.contains("vllm_kv_cache_usage_perc"));
+    }
+
+    // RocketKV T16: a prefill worker exports its scheduler gauges, but no request histogram samples
+    #[tokio::test]
+    async fn vllm_prefill_request_exports_scheduler_gauges() {
+        let registry = MetricsRegistry::new();
+        let metrics = NativeMockerMetrics::new(EngineType::Vllm, 1).unwrap();
+        metrics.register(&registry).unwrap();
+        metrics.update_scheduler_snapshot(&MockerMetrics::from_parts(0, 3, 10, 2, 4, 5, 0, 0));
+
+        let mut timing = metrics
+            .request_timing("llama", 0, true, Instant::now())
+            .await;
+        timing.record_tokens(1);
+        timing.record_normal_completion();
+
+        let running = gather_family(&registry, "vllm:num_requests_running");
+        assert_eq!(
+            metric_with_label(&running, "engine", "0")
+                .gauge
+                .as_ref()
+                .unwrap()
+                .value(),
+            2.0
+        );
+        metrics.update_scheduler_snapshot(&MockerMetrics::from_parts(0, 3, 10, 6, 4, 5, 0, 0));
+        let running = gather_family(&registry, "vllm:num_requests_running");
+        assert_eq!(
+            metric_with_label(&running, "engine", "0")
+                .gauge
+                .as_ref()
+                .unwrap()
+                .value(),
+            6.0
+        );
+        assert_eq!(
+            histogram_count(&registry, "vllm:time_to_first_token_seconds"),
+            0
+        );
     }
 
     #[tokio::test]
