@@ -7,6 +7,7 @@
 //! This module provides the runtime-dependent engine wrapper.
 
 mod handoff;
+mod images;
 mod metrics;
 
 use std::collections::HashMap;
@@ -350,6 +351,9 @@ impl MockEngine {
     }
 
     pub async fn start(&self, component: Component) -> Result<()> {
+        if !self.engine_args.is_decode() {
+            images::config(); // W2-V: load the corpus and start the image threads before the first request
+        }
         // Use primary_token() instead of child_token() so the mocker continues running
         // during graceful shutdown (Phase 1/2) and only stops in Phase 3.
         // child_token() is a child of endpoint_shutdown_token which is cancelled in Phase 1.
@@ -795,6 +799,13 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<LLMEngineOutput>, Error>
             .native_metrics
             .request_timing(&request.model, dp_rank, is_prefill, request_start)
             .await;
+
+        // RocketKV W2-V (tok_dynamo.md §1.8): a VLM worker's image work before its prefill (DYN_MOCKER_MM; off = stock)
+        if !self.engine_args.is_decode()
+            && let Some(mm) = images::config()
+        {
+            images::before_prefill(mm, &request.token_ids).await;
+        }
 
         // Convert PreprocessedRequest to DirectRequest for scheduler
         let direct_request = DirectRequest {

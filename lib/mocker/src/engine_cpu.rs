@@ -8,7 +8,8 @@
 //!   late_us   how long after the simulated GPU end the loop actually woke: time it waited for a core (T9)
 //!   wait_us   the wait itself
 //! `DYN_MOCKER_GPU_WAIT=spin` is a labelled diagnostic only (a CUDA-sync-style spin instead of the timer sleep).
-//! Each worker logs `enginecpu w= passes= sched_us= late_us= wait_us=` every 256 passes (sums).
+//! Each worker logs `enginecpu w= passes= sched_us= late_us= wait_us= lh=` every 256 passes (sums; lh = the passes'
+//! lateness histogram, bucket i: late < 2^i us, i = 0..23, for its percentiles: RocketKV W2-V).
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -44,6 +45,7 @@ pub struct Stats {
     sched_us: u64,
     late_us: u64,
     wait_us: u64,
+    lh: [u64; 24],
 }
 
 impl Stats {
@@ -55,14 +57,18 @@ impl Stats {
         self.sched_us += sched.as_micros() as u64;
         self.late_us += late.as_micros() as u64;
         self.wait_us += wait.as_micros() as u64;
+        let l = late.as_micros() as u64;
+        self.lh[((64 - l.leading_zeros()) as usize).min(23)] += 1;
         if self.passes % 256 == 0 {
+            let lh: Vec<String> = self.lh.iter().map(|x| x.to_string()).collect();
             tracing::info!(
-                "enginecpu w={} passes={} sched_us={} late_us={} wait_us={}",
+                "enginecpu w={} passes={} sched_us={} late_us={} wait_us={} lh={}",
                 self.worker,
                 self.passes,
                 self.sched_us,
                 self.late_us,
-                self.wait_us
+                self.wait_us,
+                lh.join(",")
             );
         }
     }

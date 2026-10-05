@@ -1,0 +1,406 @@
+// SPDX-License-Identifier: Apache-2.0
+//! RocketKV W2-V (`tok_dynamo.md` §1.8): a VLM worker's image work, in the mocker. Off unless `DYN_MOCKER_MM` is set
+//! (off = stock: nothing scanned, nothing waited).
+//!
+//! The workload (`tok/dyn/w2.py --images`) writes each screenshot into the prompt as an image block of N tokens, as a
+//! VLM's prompt carries N image placeholders: `start`, 8 hex-digit tokens (the image's uid), `pad` x (N - 10), `end`.
+//! The frontend tokenizes them like any text; the mocker counts them as prompt tokens (GPU prefill from AIC, KV prefix
+//! reuse by block hash, like the placeholders of a real VLM). A prefill (or aggregated) worker additionally, per
+//! request, before scheduling it:
+//!   1 finds the image blocks (one linear scan of the token IDs, every mode alike);
+//!   2 looks each uid up in its processor cache (an LRU of `DYN_MOCKER_MM_CACHE_N` images per worker: vLLM's 4 GiB per
+//!     process holds ~190 processed Qwen3-VL 720p images); a hit costs nothing, as in vLLM;
+//!   3 preprocesses the misses, per `DYN_MOCKER_MM`:
+//!       rust     for real, on this process's cores (the worker shares the frontend's k cores under A8): base64 decode
+//!                of the image's data URI + decode (Dynamo's decoder) + the model's processor (llm-multimodal, the
+//!                MM.9 library), on `DYN_MOCKER_MM_THREADS` threads per worker (1 = one processor per engine process,
+//!                as vLLM runs it); corpus image = uid % the corpus's images of `DYN_MOCKER_MM_CLASS`
+//!       emulate  the CMM (EMULATED, labelled): no host work, the request waits `DYN_MOCKER_MM_EMU_MS` per miss (MM.9's
+//!                CMM latency per image + the pool read)
+//!       ideal    nothing (the ceiling)
+//!   4 waits the vision encoder, `DYN_MOCKER_MM_ENC_MS` per miss (A10, modelled; an encode stage ahead of the prefill
+//!     GPU, as Dynamo's E/P/D runs it), in every mode.
+//! Telemetry (cumulative, every `DYN_MOCKER_MM_EVERY` requests; nothing per request is logged):
+//!   `mmwork w=<pid> mode= reqs= imgs= miss= queue_us= prep_us= cpu_us= emu_us= enc_us= wait_us= h=<log2 ms buckets>`
+//! where wait = what the request waited for steps 3 + 4, h its histogram (bucket i: wait < 2^i ms, i = 0..15).
+use std::collections::VecDeque;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Mode {
+    Rust,
+    Emulate,
+    Ideal,
+}
+
+pub struct Config {
+    pub mode: Mode,
+    start: u32,
+    pad: u32,
+    end: u32,
+    hex0: u32,
+    emu: Duration,
+    enc: Duration,
+    cache_n: usize,
+    every: u64,
+}
+
+pub fn config() -> Option<&'static Config> {
+    static C: OnceLock<Option<Config>> = OnceLock::new();
+    C.get_or_init(|| {
+        let mode = match std::env::var("DYN_MOCKER_MM").ok().as_deref() {
+            None | Some("") | Some("off") => return None,
+            Some("rust") => Mode::Rust,
+            Some("emulate") => Mode::Emulate,
+            Some("ideal") => Mode::Ideal,
+            Some(o) => panic!("DYN_MOCKER_MM={o}: rust, emulate, ideal or off"),
+        };
+        let toks: Vec<u32> = std::env::var("DYN_MOCKER_MM_TOKENS")
+            .expect("DYN_MOCKER_MM needs DYN_MOCKER_MM_TOKENS=start,pad,end,hex0 (w2.py's meta)")
+            .split(',')
+            .map(|t| t.trim().parse().expect("DYN_MOCKER_MM_TOKENS: four token ids"))
+            .collect();
+        assert_eq!(toks.len(), 4, "DYN_MOCKER_MM_TOKENS: start,pad,end,hex0");
+        let ms = |k: &str, d: f64| -> Duration {
+            Duration::from_secs_f64(std::env::var(k).ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(d) / 1e3)
+        };
+        let num = |k: &str, d: u64| -> u64 { std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d) };
+        let c = Config {
+            mode,
+            start: toks[0],
+            pad: toks[1],
+            end: toks[2],
+            hex0: toks[3],
+            emu: ms("DYN_MOCKER_MM_EMU_MS", 8.1),
+            enc: ms("DYN_MOCKER_MM_ENC_MS", 0.0),
+            cache_n: num("DYN_MOCKER_MM_CACHE_N", 190) as usize,
+            every: num("DYN_MOCKER_MM_EVERY", 16).max(1),
+        };
+        if mode == Mode::Rust {
+            pool::start().unwrap_or_else(|e| panic!("DYN_MOCKER_MM=rust: {e}"));
+        }
+        tracing::info!(
+            mode = ?mode, emu_ms = c.emu.as_secs_f64() * 1e3, enc_ms = c.enc.as_secs_f64() * 1e3, cache_n = c.cache_n,
+            "mocker images on (DYN_MOCKER_MM): image blocks preprocessed in the worker"
+        );
+        Some(c)
+    })
+    .as_ref()
+}
+
+/// The uids of the image blocks in a prompt, in order.
+pub fn scan(c: &Config, tokens: &[u32]) -> Vec<u32> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        if tokens[i] == c.start && i + 9 <= tokens.len() {
+            let mut uid = 0u32;
+            let mut ok = true;
+            for &t in &tokens[i + 1..i + 9] {
+                match t.checked_sub(c.hex0) {
+                    Some(d) if d < 16 => uid = uid << 4 | d,
+                    _ => ok = false,
+                }
+            }
+            if ok {
+                out.push(uid);
+                i += 9;
+                while i < tokens.len() && tokens[i] == c.pad {
+                    i += 1;
+                }
+                if i < tokens.len() && tokens[i] == c.end {
+                    i += 1;
+                }
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+#[derive(Default)]
+struct Stats {
+    reqs: u64,
+    imgs: u64,
+    miss: u64,
+    queue_us: u64,
+    prep_us: u64,
+    cpu_us: u64,
+    emu_us: u64,
+    enc_us: u64,
+    wait_us: u64,
+    h: [u64; 16],
+}
+
+struct Worker {
+    cache: VecDeque<u32>,
+    st: Stats,
+}
+
+fn worker() -> &'static Mutex<Worker> {
+    static W: OnceLock<Mutex<Worker>> = OnceLock::new();
+    W.get_or_init(|| Mutex::new(Worker { cache: VecDeque::new(), st: Stats::default() }))
+}
+
+/// Steps 2-4 for one request's prompt; returns when the request may be scheduled.
+pub async fn before_prefill(c: &Config, tokens: &[u32]) {
+    let uids = scan(c, tokens);
+    let t0 = Instant::now();
+    let misses: Vec<u32> = {
+        let mut w = worker().lock().unwrap();
+        let mut m = Vec::new();
+        for &u in &uids {
+            if let Some(p) = w.cache.iter().position(|&x| x == u) {
+                w.cache.remove(p);
+            } else {
+                m.push(u);
+            }
+            w.cache.push_back(u);
+            if w.cache.len() > c.cache_n {
+                w.cache.pop_front();
+            }
+        }
+        m
+    };
+    let (mut queue, mut prep, mut cpu, mut emu) = (0u64, 0u64, 0u64, 0u64);
+    if !misses.is_empty() {
+        match c.mode {
+            Mode::Rust => {
+                let r = pool::run(misses.clone()).await;
+                queue = r.0;
+                prep = r.1;
+                cpu = r.2;
+            }
+            Mode::Emulate => {
+                let d = c.emu * misses.len() as u32;
+                tokio::time::sleep(d).await;
+                emu = d.as_micros() as u64;
+            }
+            Mode::Ideal => {}
+        }
+        if !c.enc.is_zero() {
+            tokio::time::sleep(c.enc * misses.len() as u32).await;
+        }
+    }
+    let enc = (c.enc * misses.len() as u32).as_micros() as u64;
+    let wait = t0.elapsed().as_micros() as u64;
+    let mut w = worker().lock().unwrap();
+    let s = &mut w.st;
+    s.reqs += 1;
+    s.imgs += uids.len() as u64;
+    s.miss += misses.len() as u64;
+    s.queue_us += queue;
+    s.prep_us += prep;
+    s.cpu_us += cpu;
+    s.emu_us += emu;
+    s.enc_us += enc;
+    s.wait_us += wait;
+    let b = (64 - (wait / 1000).leading_zeros()) as usize; // wait < 2^b ms
+    s.h[b.min(15)] += 1;
+    if s.reqs % c.every == 0 {
+        let h: Vec<String> = s.h.iter().map(|x| x.to_string()).collect();
+        tracing::info!(
+            "mmwork w={} mode={:?} reqs={} imgs={} miss={} queue_us={} prep_us={} cpu_us={} emu_us={} enc_us={} wait_us={} h={}",
+            std::process::id(),
+            c.mode,
+            s.reqs,
+            s.imgs,
+            s.miss,
+            s.queue_us,
+            s.prep_us,
+            s.cpu_us,
+            s.emu_us,
+            s.enc_us,
+            s.wait_us,
+            h.join(",")
+        );
+    }
+}
+
+#[cfg(feature = "mm-routing")]
+mod pool {
+    //! The worker's image threads: each owns a processor; jobs = one request's misses, processed in order.
+    use std::io::Cursor;
+    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex, OnceLock};
+    use std::time::Instant;
+
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use llm_multimodal::{PreProcessorConfig, VisionProcessorRegistry};
+
+    struct Job {
+        uids: Vec<u32>,
+        enq: Instant,
+        tx: tokio::sync::oneshot::Sender<(u64, u64, u64)>,
+    }
+
+    struct Corpus {
+        uris: Vec<String>,
+        cfg: PreProcessorConfig,
+        model: String,
+    }
+
+    static TX: OnceLock<Mutex<mpsc::Sender<Job>>> = OnceLock::new();
+
+    fn thread_cpu_us() -> u64 {
+        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+        ts.tv_sec as u64 * 1_000_000 + ts.tv_nsec as u64 / 1000
+    }
+
+    fn load() -> Result<Corpus, String> {
+        let dir = std::env::var("DYN_MOCKER_MM_CORPUS").map_err(|_| "DYN_MOCKER_MM_CORPUS (a directory of images)")?;
+        let class = std::env::var("DYN_MOCKER_MM_CLASS").unwrap_or_else(|_| "agent720".into());
+        let cfgp = std::env::var("DYN_MOCKER_MM_CFG").map_err(|_| "DYN_MOCKER_MM_CFG (a processor config json)")?;
+        let mut paths: Vec<_> = std::fs::read_dir(&dir)
+            .map_err(|e| format!("{dir}: {e}"))?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with(&format!("{class}-"))))
+            .collect();
+        paths.sort();
+        let mut uris = Vec::new();
+        for p in &paths {
+            let mime = match p.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase().as_str() {
+                "png" => "image/png",
+                "jpg" | "jpeg" => "image/jpeg",
+                _ => continue,
+            };
+            let b = std::fs::read(p).map_err(|e| format!("{}: {e}", p.display()))?;
+            uris.push(format!("data:{mime};base64,{}", STANDARD.encode(&b)));
+        }
+        if uris.is_empty() {
+            return Err(format!("no {class}-* images in {dir}"));
+        }
+        let cfg = PreProcessorConfig::from_json(&std::fs::read_to_string(&cfgp).map_err(|e| format!("{cfgp}: {e}"))?)
+            .map_err(|e| format!("{cfgp}: {e}"))?;
+        let model = std::path::Path::new(&cfgp).file_stem().unwrap().to_string_lossy().to_string();
+        VisionProcessorRegistry::with_defaults().find(&model, None).ok_or(format!("no llm-multimodal processor for {model}"))?;
+        tracing::info!(images = uris.len(), class, model, "mocker images: corpus loaded");
+        Ok(Corpus { uris, cfg, model })
+    }
+
+    pub fn start() -> Result<(), String> {
+        let corpus = Arc::new(load()?);
+        let n: usize = std::env::var("DYN_MOCKER_MM_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(1).max(1);
+        let (tx, rx) = mpsc::channel::<Job>();
+        let rx = Arc::new(Mutex::new(rx));
+        for i in 0..n {
+            let (rx, corpus) = (rx.clone(), corpus.clone());
+            std::thread::Builder::new()
+                .name(format!("mm-prep-{i}"))
+                .spawn(move || {
+                    let reg = VisionProcessorRegistry::with_defaults();
+                    let p = reg.find(&corpus.model, None).expect("checked at load");
+                    loop {
+                        let job = match rx.lock().unwrap().recv() {
+                            Ok(j) => j,
+                            Err(_) => return,
+                        };
+                        let (t, c) = (Instant::now(), thread_cpu_us());
+                        let queue = t.duration_since(job.enq).as_micros() as u64;
+                        for u in &job.uids {
+                            let uri = &corpus.uris[*u as usize % corpus.uris.len()];
+                            let bytes = STANDARD.decode(&uri[uri.find(',').unwrap() + 1..]).expect("corpus base64");
+                            let img = image::ImageReader::new(Cursor::new(&bytes))
+                                .with_guessed_format()
+                                .expect("corpus image")
+                                .decode()
+                                .expect("corpus image decodes");
+                            std::hint::black_box(p.preprocess(std::slice::from_ref(&img), &corpus.cfg).expect("preprocess"));
+                        }
+                        let _ = job.tx.send((queue, t.elapsed().as_micros() as u64, thread_cpu_us() - c));
+                    }
+                })
+                .map_err(|e| e.to_string())?;
+        }
+        TX.set(Mutex::new(tx)).map_err(|_| "image pool started twice".to_string())
+    }
+
+    /// (queue, processing wall, processing CPU) in us for one request's misses.
+    pub async fn run(uids: Vec<u32>) -> (u64, u64, u64) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        TX.get().expect("pool started").lock().unwrap().send(Job { uids, enq: Instant::now(), tx }).expect("pool alive");
+        rx.await.expect("pool answers")
+    }
+}
+
+#[cfg(not(feature = "mm-routing"))]
+mod pool {
+    pub fn start() -> Result<(), String> {
+        Err("this build has no llm-multimodal: build the bindings with --features mm-routing (tok/dyn/build.sh dynamo)".into())
+    }
+    pub async fn run(_uids: Vec<u32>) -> (u64, u64, u64) {
+        unreachable!("start() refused")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg() -> Config {
+        Config {
+            mode: Mode::Ideal,
+            start: 100,
+            pad: 101,
+            end: 102,
+            hex0: 110,
+            emu: Duration::ZERO,
+            enc: Duration::ZERO,
+            cache_n: 2,
+            every: 1,
+        }
+    }
+
+    fn block(uid: u32, n: usize) -> Vec<u32> {
+        let mut v = vec![100];
+        v.extend((0..8).rev().map(|i| 110 + (uid >> (4 * i) & 15)));
+        v.extend(std::iter::repeat_n(101, n - 10));
+        v.push(102);
+        v
+    }
+
+    #[test]
+    fn scan_finds_blocks_and_uids() {
+        let mut t = vec![1, 2, 3];
+        t.extend(block(0xdeadbeef, 40));
+        t.extend([4, 100, 5]); // a lone start token followed by text is not a block
+        t.extend(block(7, 12));
+        assert_eq!(scan(&cfg(), &t), vec![0xdeadbeef, 7]);
+        assert!(scan(&cfg(), &[1, 2, 3]).is_empty());
+    }
+
+    /// The real path (rust mode): RK_MM_CORPUS=<RocketKV>/tok/mm/corpus RK_MM_CFG=<RocketKV>/tok/mm/cfg/qwen3-vl-cap1280-bicubic.json
+    /// (class shot1080: the committed originals); skipped without them.
+    #[cfg(feature = "mm-routing")]
+    #[tokio::test]
+    async fn rust_pool_preprocesses_corpus_images() {
+        let (Ok(dir), Ok(cfg)) = (std::env::var("RK_MM_CORPUS"), std::env::var("RK_MM_CFG")) else {
+            eprintln!("skipped: set RK_MM_CORPUS and RK_MM_CFG");
+            return;
+        };
+        unsafe {
+            std::env::set_var("DYN_MOCKER_MM_CORPUS", dir);
+            std::env::set_var("DYN_MOCKER_MM_CFG", cfg);
+            std::env::set_var("DYN_MOCKER_MM_CLASS", "shot1080");
+        }
+        pool::start().expect("pool starts");
+        let (queue, prep, cpu) = pool::run(vec![0, 5]).await; // two images, the second wraps around the corpus
+        assert!(prep > 0 && cpu > 0 && queue < prep, "queue {queue} prep {prep} cpu {cpu}");
+    }
+
+    #[tokio::test]
+    async fn processor_cache_is_lru_per_worker() {
+        let c = cfg();
+        let mut t = block(1, 12);
+        t.extend(block(2, 12));
+        before_prefill(&c, &t).await; // 2 misses
+        before_prefill(&c, &block(1, 12)).await; // hit
+        before_prefill(&c, &block(3, 12)).await; // miss, evicts 2
+        before_prefill(&c, &block(2, 12)).await; // miss again
+        let w = worker().lock().unwrap();
+        assert_eq!((w.st.reqs, w.st.imgs, w.st.miss), (4, 5, 4));
+    }
+}
