@@ -351,6 +351,7 @@ impl MockEngine {
     }
 
     pub async fn start(&self, component: Component) -> Result<()> {
+        let _ = dynamo_mocker::engine_cpu::config(); // RocketKV A8: every worker says it is timed at start, not at its first pass (an idle worker never ran one)
         if !self.engine_args.is_decode() {
             images::config(); // W2-V: load the corpus and start the image threads before the first request
         }
