@@ -31,9 +31,14 @@
 //!       ideal    nothing (the ceiling)
 //!   4 waits the vision encoder, `DYN_MOCKER_MM_ENC_MS` per miss (A10, modelled; an encode stage ahead of the prefill
 //!     GPU, as Dynamo's E/P/D runs it), in every mode.
+//! Placement (W2-V.3, M2): `DYN_MOCKER_MM_CPUS` (a cpu list, e.g. `40,41` or `42-57`) pins the image threads (`rust`'s
+//! processors, `cmm`'s lane clients) to the host budget's image cores, apart from the engine's own core; unset = they
+//! inherit the process's cores (W2-V.1 / V.2).
 //! Telemetry (cumulative, every `DYN_MOCKER_MM_EVERY` requests; nothing per request is logged):
-//!   `mmwork w=<pid> mode= reqs= imgs= miss= queue_us= prep_us= cpu_us= emu_us= enc_us= wait_us= idle_us= starved_us=
+//!   `mmwork w=<pid> mode= threads= reqs= imgs= miss= queue_us= prep_us= cpu_us= emu_us= enc_us= wait_us= idle_us= starved_us=
 //!    img_us= total_us= h=<log2 ms buckets>`
+//! where threads = the worker's concurrency for its misses (rust: processor threads; cmm: lanes it owns; emulate: lanes,
+//! 0 = unlimited; ideal: 0) (W2-V.3, M3: equal concurrency, AP4);
 //! where wait = what the request waited for steps 3 + 4, h its histogram (bucket i: wait < 2^i ms, i = 0..15); idle /
 //! starved / img (W2-V.2, dynamo_mocker::engine_cpu::starve, needs DYN_MOCKER_ENGINE_CPU=1): the worker's GPU idle,
 //! idle while >= 1 request was in image work (the GPU waiting on the image work), >= 1 request in image work, and the
@@ -61,6 +66,39 @@ pub struct Config {
     enc: Duration,
     cache_n: usize,
     every: u64,
+    threads: u64,
+}
+
+/// `DYN_MOCKER_MM_CPUS` as a list of cpus (`a,b,c-d`); empty when unset.
+fn mm_cpus() -> Vec<usize> {
+    parse_cpus(&std::env::var("DYN_MOCKER_MM_CPUS").unwrap_or_default())
+}
+
+fn parse_cpus(spec: &str) -> Vec<usize> {
+    let mut v = Vec::new();
+    for part in spec.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        match part.split_once('-') {
+            Some((a, b)) => v.extend(
+                a.parse::<usize>().expect("DYN_MOCKER_MM_CPUS: a cpu list")..=b.parse::<usize>().expect("DYN_MOCKER_MM_CPUS: a cpu list"),
+            ),
+            None => v.push(part.parse().expect("DYN_MOCKER_MM_CPUS: a cpu list")),
+        }
+    }
+    v
+}
+
+/// Pin the calling thread to `cpus` (none = leave it where it is); false if the kernel refused.
+fn pin_thread(cpus: &[usize]) -> bool {
+    if cpus.is_empty() {
+        return true;
+    }
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        for &c in cpus {
+            libc::CPU_SET(c, &mut set);
+        }
+        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) == 0
+    }
 }
 
 pub fn config() -> Option<&'static Config> {
@@ -95,6 +133,12 @@ pub fn config() -> Option<&'static Config> {
             enc: ms("DYN_MOCKER_MM_ENC_MS", 0.0),
             cache_n: num("DYN_MOCKER_MM_CACHE_N", 190) as usize,
             every: num("DYN_MOCKER_MM_EVERY", 16).max(1),
+            threads: match mode {
+                Mode::Rust => num("DYN_MOCKER_MM_THREADS", 1).max(1),
+                Mode::Cmm => num("DYN_MOCKER_MM_CMM_LANES", 4),
+                Mode::Emulate => num("DYN_MOCKER_MM_EMU_LANES", 0),
+                Mode::Ideal => 0,
+            },
         };
         if mode == Mode::Rust {
             pool::start().unwrap_or_else(|e| panic!("DYN_MOCKER_MM=rust: {e}"));
@@ -103,7 +147,7 @@ pub fn config() -> Option<&'static Config> {
             cmm::start().unwrap_or_else(|e| panic!("DYN_MOCKER_MM=cmm: {e}"));
         }
         tracing::info!(
-            mode = ?mode, emu_ms = c.emu.as_secs_f64() * 1e3, emu_lanes = c.lanes, enc_ms = c.enc.as_secs_f64() * 1e3, cache_n = c.cache_n,
+            mode = ?mode, threads = c.threads, cpus = ?mm_cpus(), emu_ms = c.emu.as_secs_f64() * 1e3, emu_lanes = c.lanes, enc_ms = c.enc.as_secs_f64() * 1e3, cache_n = c.cache_n,
             "mocker images on (DYN_MOCKER_MM): image blocks preprocessed in the worker"
         );
         Some(c)
@@ -242,9 +286,10 @@ pub async fn before_prefill(c: &Config, tokens: &[u32]) {
         let h: Vec<String> = s.h.iter().map(|x| x.to_string()).collect();
         let (idle, starved, img, total) = dynamo_mocker::engine_cpu::starve::snapshot();
         tracing::info!(
-            "mmwork w={} mode={:?} reqs={} imgs={} miss={} queue_us={} prep_us={} cpu_us={} emu_us={} enc_us={} wait_us={} idle_us={} starved_us={} img_us={} total_us={} h={}",
+            "mmwork w={} mode={:?} threads={} reqs={} imgs={} miss={} queue_us={} prep_us={} cpu_us={} emu_us={} enc_us={} wait_us={} idle_us={} starved_us={} img_us={} total_us={} h={}",
             std::process::id(),
             c.mode,
+            c.threads,
             s.reqs,
             s.imgs,
             s.miss,
@@ -349,13 +394,15 @@ mod pool {
     pub fn start() -> Result<(), String> {
         let corpus = Arc::new(load()?);
         let n: usize = std::env::var("DYN_MOCKER_MM_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(1).max(1);
+        let cpus = Arc::new(super::mm_cpus());
         let (tx, rx) = mpsc::channel::<Job>();
         let rx = Arc::new(Mutex::new(rx));
         for i in 0..n {
-            let (rx, corpus) = (rx.clone(), corpus.clone());
+            let (rx, corpus, cpus) = (rx.clone(), corpus.clone(), cpus.clone());
             std::thread::Builder::new()
                 .name(format!("mm-prep-{i}"))
                 .spawn(move || {
+                    assert!(super::pin_thread(&cpus), "mm-prep-{i}: cannot pin to DYN_MOCKER_MM_CPUS {cpus:?}");
                     let reg = VisionProcessorRegistry::with_defaults();
                     let p = reg.find(&corpus.model, None).expect("checked at load");
                     loop {
@@ -600,13 +647,15 @@ mod cmm {
         let mine = claim(&dir, total, want)?;
         let pool = Arc::new(Pool::open(&path, base, g.total(), cmo)?);
         let uris = super::pool::payloads()?;
+        let cpus = Arc::new(super::mm_cpus());
         let (tx, rx) = mpsc::channel::<Job>();
         let rx = Arc::new(Mutex::new(rx));
         for &lane in &mine {
-            let (rx, pool, uris) = (rx.clone(), pool.clone(), uris.clone());
+            let (rx, pool, uris, cpus) = (rx.clone(), pool.clone(), uris.clone(), cpus.clone());
             std::thread::Builder::new()
                 .name(format!("mm-cmm-{lane}"))
                 .spawn(move || {
+                    assert!(super::pin_thread(&cpus), "mm-cmm-{lane}: cannot pin to DYN_MOCKER_MM_CPUS {cpus:?}");
                     let lo = g.lane_off(lane);
                     loop {
                         let job = match rx.lock().unwrap().recv() {
@@ -751,6 +800,7 @@ mod tests {
             enc: Duration::ZERO,
             cache_n: 2,
             every: 1,
+            threads: 0,
         }
     }
 
@@ -760,6 +810,31 @@ mod tests {
         v.extend(std::iter::repeat_n(101, n - 10));
         v.push(102);
         v
+    }
+
+    #[test]
+    fn mm_cpus_parse_and_pin() {
+        assert_eq!(parse_cpus("40,41"), vec![40, 41]);
+        assert_eq!(parse_cpus(" 42-45 ,50"), vec![42, 43, 44, 45, 50]);
+        assert!(parse_cpus("").is_empty());
+        assert!(pin_thread(&[]), "no list: the thread stays where it is");
+        // pin a fresh thread to the first cpu this process may use, and read it back
+        let mine = unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set);
+            (0..libc::CPU_SETSIZE as usize).find(|&c| libc::CPU_ISSET(c, &set)).unwrap()
+        };
+        let got = std::thread::spawn(move || {
+            assert!(pin_thread(&[mine]));
+            unsafe {
+                let mut set: libc::cpu_set_t = std::mem::zeroed();
+                libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set);
+                (0..libc::CPU_SETSIZE as usize).filter(|&c| libc::CPU_ISSET(c, &set)).collect::<Vec<_>>()
+            }
+        })
+        .join()
+        .unwrap();
+        assert_eq!(got, vec![mine]);
     }
 
     #[test]

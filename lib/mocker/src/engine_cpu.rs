@@ -7,7 +7,11 @@
 //!   sched_us  wall time of the pass's own CPU work (scheduling, KV bookkeeping, output publication) before its wait
 //!   late_us   how long after the simulated GPU end the loop actually woke: time it waited for a core (T9)
 //!   wait_us   the wait itself
-//! `DYN_MOCKER_GPU_WAIT=spin` is a labelled diagnostic only (a CUDA-sync-style spin instead of the timer sleep).
+//! `DYN_MOCKER_GPU_WAIT=spin` is a labelled diagnostic only (a CUDA-sync-style spin instead of the timer sleep; aggregated
+//! workers only: the P/D wait never spun, and an idle engine sleeps on its channels either way).
+//! `DYN_MOCKER_GPU_WAIT=hold` (RocketKV W2-V.3, M1): the engine holds its host core for its whole life, idle included, as a
+//! vLLM engine's busy loop does: the worker starts one SCHED_IDLE spinning thread (`engine-spin`, dynamo-llm mocker.rs) on
+//! the process's cores; it yields to the engine's own threads at once, so the step loop and its timing stay stock.
 //! Each worker logs `enginecpu w= passes= sched_us= late_us= wait_us= lh=` every 256 passes or 5 s, whichever comes
 //! first (sums; lh = the passes' lateness histogram, bucket i: late < 2^i us, i = 0..23, for its percentiles: RocketKV
 //! W2-V). Aggregated and disaggregated (P/D) workers alike (W2-V.1 found P/D passes untimed).
@@ -17,6 +21,8 @@ use std::time::{Duration, Instant};
 
 pub struct Config {
     pub spin_wait: bool,
+    /// W2-V.3 (M1): a spinner occupies the engine's core (`DYN_MOCKER_GPU_WAIT=hold`)
+    pub hold: bool,
 }
 
 pub fn config() -> Option<&'static Config> {
@@ -25,9 +31,10 @@ pub fn config() -> Option<&'static Config> {
         if std::env::var("DYN_MOCKER_ENGINE_CPU").ok().as_deref() != Some("1") {
             return None;
         }
-        let spin_wait = std::env::var("DYN_MOCKER_GPU_WAIT").ok().as_deref() == Some("spin");
-        tracing::info!(spin_wait, "mocker engine CPU on (DYN_MOCKER_ENGINE_CPU=1): step loop timed, nothing added");
-        Some(Config { spin_wait })
+        let wait = std::env::var("DYN_MOCKER_GPU_WAIT").ok();
+        let (spin_wait, hold) = (wait.as_deref() == Some("spin"), wait.as_deref() == Some("hold"));
+        tracing::info!(spin_wait, hold, "mocker engine CPU on (DYN_MOCKER_ENGINE_CPU=1): step loop timed, nothing added");
+        Some(Config { spin_wait, hold })
     })
     .as_ref()
 }

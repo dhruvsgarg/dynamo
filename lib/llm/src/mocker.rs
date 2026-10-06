@@ -351,7 +351,10 @@ impl MockEngine {
     }
 
     pub async fn start(&self, component: Component) -> Result<()> {
-        let _ = dynamo_mocker::engine_cpu::config(); // RocketKV A8: every worker says it is timed at start, not at its first pass (an idle worker never ran one)
+        let ec = dynamo_mocker::engine_cpu::config(); // RocketKV A8: every worker says it is timed at start, not at its first pass (an idle worker never ran one)
+        if ec.is_some_and(|c| c.hold) {
+            hold_core(); // RocketKV W2-V.3 (M1): this engine occupies its core, idle included
+        }
         if !self.engine_args.is_decode() {
             images::config(); // W2-V: load the corpus and start the image threads before the first request
         }
@@ -1224,6 +1227,26 @@ pub async fn make_mocker_engine(
     Ok(Arc::new(annotated_engine))
 }
 
+
+/// RocketKV W2-V.3 (M1, `DYN_MOCKER_GPU_WAIT=hold`): a vLLM engine's busy loop keeps its host core busy for the engine's
+/// whole life, idle included; the mocker's loop sleeps. One thread spins on the process's cores (the harness pins each
+/// engine to its own core) at SCHED_IDLE, so it yields to the engine's own threads at once: the step loop runs and is
+/// timed as stock, while the core stays busy (its CPU is the engine's, cpu/s ~ 1.0) and at its clock (RocketKV TD18).
+fn hold_core() {
+    let spawned = std::thread::Builder::new().name("engine-spin".into()).spawn(|| {
+        let p = libc::sched_param { sched_priority: 0 };
+        // pid 0 = this thread on Linux
+        let idle = unsafe { libc::sched_setscheduler(0, libc::SCHED_IDLE, &p) } == 0;
+        tracing::info!(sched_idle = idle, "mocker engine holds its core (DYN_MOCKER_GPU_WAIT=hold): engine-spin on");
+        loop {
+            std::hint::spin_loop();
+        }
+    });
+    if let Err(e) = spawned {
+        tracing::error!("DYN_MOCKER_GPU_WAIT=hold: cannot start engine-spin: {e}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1249,6 +1272,24 @@ mod tests {
             .annotations(vec![])
             .build()
             .unwrap()
+    }
+
+    /// RocketKV W2-V.3 (M1): `hold` starts a thread named engine-spin that runs at SCHED_IDLE (it yields to the engine).
+    #[test]
+    fn hold_core_spins_at_sched_idle() {
+        hold_core();
+        let t0 = std::time::Instant::now();
+        loop {
+            for e in std::fs::read_dir("/proc/self/task").unwrap() {
+                let Ok(tid) = e.unwrap().file_name().to_string_lossy().parse::<i32>() else { continue };
+                let comm = std::fs::read_to_string(format!("/proc/self/task/{tid}/comm")).unwrap_or_default();
+                if comm.trim() == "engine-spin" && unsafe { libc::sched_getscheduler(tid) } == libc::SCHED_IDLE {
+                    return;
+                }
+            }
+            assert!(t0.elapsed() < Duration::from_secs(5), "no engine-spin thread at SCHED_IDLE after 5 s");
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[tokio::test(start_paused = true)]
