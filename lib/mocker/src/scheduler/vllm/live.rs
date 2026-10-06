@@ -206,16 +206,19 @@ impl Scheduler {
                     total_time.is_zero() && !pending.made_progress_since(&metrics_before);
                 publisher.publish_pass_start(&mut pending);
                 // RocketKV A8: same work and wait as stock, only timed (engine_cpu.rs; off = stock)
-                if let (Some(ec), false) = (crate::engine_cpu::config(), controls_enabled) {
+                let ec = crate::engine_cpu::config();
+                if let (Some(ec), false) = (ec, controls_enabled) {
                     let sched = iteration_start.elapsed();
                     let deadline = iteration_start + total_time;
                     let t_wait = Instant::now();
                     if total_time > std::time::Duration::ZERO {
+                        crate::engine_cpu::starve::gpu(true);
                         if ec.spin_wait {
                             let _ = tokio::task::spawn_blocking(move || crate::engine_cpu::spin_until(deadline)).await;
                         } else {
                             sleep_until_precise(deadline).await;
                         }
+                        crate::engine_cpu::starve::gpu(false);
                     }
                     if !zero_progress {
                         let now = Instant::now();
@@ -223,6 +226,11 @@ impl Scheduler {
                     }
                 } else if total_time > std::time::Duration::ZERO {
                     let deadline = iteration_start + total_time;
+                    // RocketKV A8 in P/D too (W2-V.1 had no lateness for P/D workers): the pass boundary's wait, timed
+                    let (sched, t_wait) = (iteration_start.elapsed(), Instant::now());
+                    if ec.is_some() {
+                        crate::engine_cpu::starve::gpu(true);
+                    }
                     if controls_enabled {
                         if !wait_for_pass_boundary(
                             &mut core,
@@ -239,6 +247,13 @@ impl Scheduler {
                         }
                     } else {
                         sleep_until_precise(deadline).await;
+                    }
+                    if ec.is_some() {
+                        crate::engine_cpu::starve::gpu(false);
+                        if !zero_progress {
+                            let now = Instant::now();
+                            engine_stats.add(sched, now.saturating_duration_since(deadline), now - t_wait);
+                        }
                     }
                 }
                 publisher.publish_pass(&mut core, pending).await;

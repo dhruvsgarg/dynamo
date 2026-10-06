@@ -8,8 +8,10 @@
 //!   late_us   how long after the simulated GPU end the loop actually woke: time it waited for a core (T9)
 //!   wait_us   the wait itself
 //! `DYN_MOCKER_GPU_WAIT=spin` is a labelled diagnostic only (a CUDA-sync-style spin instead of the timer sleep).
-//! Each worker logs `enginecpu w= passes= sched_us= late_us= wait_us= lh=` every 256 passes (sums; lh = the passes'
-//! lateness histogram, bucket i: late < 2^i us, i = 0..23, for its percentiles: RocketKV W2-V).
+//! Each worker logs `enginecpu w= passes= sched_us= late_us= wait_us= lh=` every 256 passes or 5 s, whichever comes
+//! first (sums; lh = the passes' lateness histogram, bucket i: late < 2^i us, i = 0..23, for its percentiles: RocketKV
+//! W2-V). Aggregated and disaggregated (P/D) workers alike (W2-V.1 found P/D passes untimed).
+//! `starve` (W2-V.2): whether the simulated GPU sits idle while requests wait in the worker's image work.
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -46,6 +48,7 @@ pub struct Stats {
     late_us: u64,
     wait_us: u64,
     lh: [u64; 24],
+    last: Option<Instant>,
 }
 
 impl Stats {
@@ -59,7 +62,9 @@ impl Stats {
         self.wait_us += wait.as_micros() as u64;
         let l = late.as_micros() as u64;
         self.lh[((64 - l.leading_zeros()) as usize).min(23)] += 1;
-        if self.passes % 256 == 0 {
+        let due = self.last.is_none_or(|t| t.elapsed() >= Duration::from_secs(5));
+        if self.passes % 256 == 0 || due {
+            self.last = Some(Instant::now());
             let lh: Vec<String> = self.lh.iter().map(|x| x.to_string()).collect();
             tracing::info!(
                 "enginecpu w={} passes={} sched_us={} late_us={} wait_us={} lh={}",
@@ -70,6 +75,88 @@ impl Stats {
                 self.wait_us,
                 lh.join(",")
             );
+        }
+    }
+}
+
+/// RocketKV W2-V.2 (`tok_dynamo.md` §1.8): does the simulated GPU wait on the host's image work? One worker process =
+/// one scheduler (dp 1), so process-wide sums. `gpu(true/false)` brackets each pass's simulated GPU time (the timed
+/// wait in scheduler/vllm/live.rs); `img(true/false)` brackets one request's image work (lib/llm/src/mocker/images.rs).
+/// From the first event: idle = the GPU not busy; starved = idle while >= 1 request is in image work (the GPU waits on
+/// the CPU, or on the CMM); img = >= 1 request in image work. Telemetry only: nothing waits on it.
+pub mod starve {
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    struct S {
+        gpu: bool,
+        img: u32,
+        since: Option<Instant>,
+        idle_us: u64,
+        starved_us: u64,
+        img_us: u64,
+        total_us: u64,
+    }
+
+    static ST: Mutex<S> =
+        Mutex::new(S { gpu: false, img: 0, since: None, idle_us: 0, starved_us: 0, img_us: 0, total_us: 0 });
+
+    fn tick(s: &mut S) {
+        let now = Instant::now();
+        if let Some(t) = s.since {
+            let d = now.duration_since(t).as_micros() as u64;
+            s.total_us += d;
+            if !s.gpu {
+                s.idle_us += d;
+                if s.img > 0 {
+                    s.starved_us += d;
+                }
+            }
+            if s.img > 0 {
+                s.img_us += d;
+            }
+        }
+        s.since = Some(now);
+    }
+
+    pub fn gpu(busy: bool) {
+        let mut s = ST.lock().unwrap();
+        tick(&mut s);
+        s.gpu = busy;
+    }
+
+    pub fn img(enter: bool) {
+        let mut s = ST.lock().unwrap();
+        tick(&mut s);
+        s.img = if enter { s.img + 1 } else { s.img.saturating_sub(1) };
+    }
+
+    /// (idle_us, starved_us, img_us, total_us) since the first event.
+    pub fn snapshot() -> (u64, u64, u64, u64) {
+        let mut s = ST.lock().unwrap();
+        tick(&mut s);
+        (s.idle_us, s.starved_us, s.img_us, s.total_us)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        fn starved_counts_idle_time_with_images_in_flight() {
+            use std::thread::sleep;
+            use std::time::Duration;
+            super::gpu(true); // GPU busy, no images: neither idle nor starved
+            sleep(Duration::from_millis(20));
+            super::img(true); // busy with an image in flight: img only
+            sleep(Duration::from_millis(20));
+            super::gpu(false); // idle with an image in flight: starved
+            sleep(Duration::from_millis(30));
+            super::img(false); // idle, no image: idle only
+            sleep(Duration::from_millis(20));
+            let (idle, starved, img, total) = super::snapshot();
+            assert!((88_000..130_000).contains(&total), "total {total}");
+            assert!((48_000..80_000).contains(&idle), "idle {idle}");
+            assert!((28_000..45_000).contains(&starved), "starved {starved}");
+            assert!((48_000..70_000).contains(&img), "img {img}");
         }
     }
 }

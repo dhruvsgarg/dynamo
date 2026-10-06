@@ -16,13 +16,19 @@
 //!                MM.9 library), on `DYN_MOCKER_MM_THREADS` threads per worker (1 = one processor per engine process,
 //!                as vLLM runs it); corpus image = uid % the corpus's images of `DYN_MOCKER_MM_CLASS`
 //!       emulate  the CMM (EMULATED, labelled): no host work, the request waits `DYN_MOCKER_MM_EMU_MS` per miss (MM.9's
-//!                CMM latency per image + the pool read)
+//!                CMM latency per image + the pool read) on one of `DYN_MOCKER_MM_EMU_LANES` lanes per worker (the
+//!                CMM's 16 cores shared by the prefill workers: 16 / workers; 0 = unlimited, W2-V.1), queueing for a
+//!                lane like rust queues for its threads
 //!       ideal    nothing (the ceiling)
 //!   4 waits the vision encoder, `DYN_MOCKER_MM_ENC_MS` per miss (A10, modelled; an encode stage ahead of the prefill
 //!     GPU, as Dynamo's E/P/D runs it), in every mode.
 //! Telemetry (cumulative, every `DYN_MOCKER_MM_EVERY` requests; nothing per request is logged):
-//!   `mmwork w=<pid> mode= reqs= imgs= miss= queue_us= prep_us= cpu_us= emu_us= enc_us= wait_us= h=<log2 ms buckets>`
-//! where wait = what the request waited for steps 3 + 4, h its histogram (bucket i: wait < 2^i ms, i = 0..15).
+//!   `mmwork w=<pid> mode= reqs= imgs= miss= queue_us= prep_us= cpu_us= emu_us= enc_us= wait_us= idle_us= starved_us=
+//!    img_us= total_us= h=<log2 ms buckets>`
+//! where wait = what the request waited for steps 3 + 4, h its histogram (bucket i: wait < 2^i ms, i = 0..15); idle /
+//! starved / img (W2-V.2, dynamo_mocker::engine_cpu::starve, needs DYN_MOCKER_ENGINE_CPU=1): the worker's GPU idle,
+//! idle while >= 1 request was in image work (the GPU waiting on the image work), >= 1 request in image work, and the
+//! time since the first such event.
 use std::collections::VecDeque;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -41,6 +47,7 @@ pub struct Config {
     end: u32,
     hex0: u32,
     emu: Duration,
+    lanes: usize,
     enc: Duration,
     cache_n: usize,
     every: u64,
@@ -73,6 +80,7 @@ pub fn config() -> Option<&'static Config> {
             end: toks[2],
             hex0: toks[3],
             emu: ms("DYN_MOCKER_MM_EMU_MS", 8.1),
+            lanes: num("DYN_MOCKER_MM_EMU_LANES", 0) as usize,
             enc: ms("DYN_MOCKER_MM_ENC_MS", 0.0),
             cache_n: num("DYN_MOCKER_MM_CACHE_N", 190) as usize,
             every: num("DYN_MOCKER_MM_EVERY", 16).max(1),
@@ -81,7 +89,7 @@ pub fn config() -> Option<&'static Config> {
             pool::start().unwrap_or_else(|e| panic!("DYN_MOCKER_MM=rust: {e}"));
         }
         tracing::info!(
-            mode = ?mode, emu_ms = c.emu.as_secs_f64() * 1e3, enc_ms = c.enc.as_secs_f64() * 1e3, cache_n = c.cache_n,
+            mode = ?mode, emu_ms = c.emu.as_secs_f64() * 1e3, emu_lanes = c.lanes, enc_ms = c.enc.as_secs_f64() * 1e3, cache_n = c.cache_n,
             "mocker images on (DYN_MOCKER_MM): image blocks preprocessed in the worker"
         );
         Some(c)
@@ -144,10 +152,26 @@ fn worker() -> &'static Mutex<Worker> {
     W.get_or_init(|| Mutex::new(Worker { cache: VecDeque::new(), st: Stats::default() }))
 }
 
+fn lanes(n: usize) -> &'static tokio::sync::Semaphore {
+    static L: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
+    L.get_or_init(|| tokio::sync::Semaphore::new(n))
+}
+
+/// The CMM, EMULATED: one lane (if limited) for the request's misses, `emu` each; (queue, emulated) in us.
+async fn emulate(c: &Config, misses: usize) -> (u64, u64) {
+    let t = Instant::now();
+    let _lane = if c.lanes > 0 { Some(lanes(c.lanes).acquire().await.expect("lanes open")) } else { None };
+    let queue = t.elapsed().as_micros() as u64;
+    let d = c.emu * misses as u32;
+    tokio::time::sleep(d).await;
+    (queue, d.as_micros() as u64)
+}
+
 /// Steps 2-4 for one request's prompt; returns when the request may be scheduled.
 pub async fn before_prefill(c: &Config, tokens: &[u32]) {
     let uids = scan(c, tokens);
     let t0 = Instant::now();
+    dynamo_mocker::engine_cpu::starve::img(true);
     let misses: Vec<u32> = {
         let mut w = worker().lock().unwrap();
         let mut m = Vec::new();
@@ -173,11 +197,7 @@ pub async fn before_prefill(c: &Config, tokens: &[u32]) {
                 prep = r.1;
                 cpu = r.2;
             }
-            Mode::Emulate => {
-                let d = c.emu * misses.len() as u32;
-                tokio::time::sleep(d).await;
-                emu = d.as_micros() as u64;
-            }
+            Mode::Emulate => (queue, emu) = emulate(c, misses.len()).await,
             Mode::Ideal => {}
         }
         if !c.enc.is_zero() {
@@ -186,6 +206,7 @@ pub async fn before_prefill(c: &Config, tokens: &[u32]) {
     }
     let enc = (c.enc * misses.len() as u32).as_micros() as u64;
     let wait = t0.elapsed().as_micros() as u64;
+    dynamo_mocker::engine_cpu::starve::img(false);
     let mut w = worker().lock().unwrap();
     let s = &mut w.st;
     s.reqs += 1;
@@ -201,8 +222,9 @@ pub async fn before_prefill(c: &Config, tokens: &[u32]) {
     s.h[b.min(15)] += 1;
     if s.reqs % c.every == 0 {
         let h: Vec<String> = s.h.iter().map(|x| x.to_string()).collect();
+        let (idle, starved, img, total) = dynamo_mocker::engine_cpu::starve::snapshot();
         tracing::info!(
-            "mmwork w={} mode={:?} reqs={} imgs={} miss={} queue_us={} prep_us={} cpu_us={} emu_us={} enc_us={} wait_us={} h={}",
+            "mmwork w={} mode={:?} reqs={} imgs={} miss={} queue_us={} prep_us={} cpu_us={} emu_us={} enc_us={} wait_us={} idle_us={} starved_us={} img_us={} total_us={} h={}",
             std::process::id(),
             c.mode,
             s.reqs,
@@ -214,6 +236,10 @@ pub async fn before_prefill(c: &Config, tokens: &[u32]) {
             s.emu_us,
             s.enc_us,
             s.wait_us,
+            idle,
+            starved,
+            img,
+            total,
             h.join(",")
         );
     }
@@ -348,6 +374,7 @@ mod tests {
             end: 102,
             hex0: 110,
             emu: Duration::ZERO,
+            lanes: 0,
             enc: Duration::ZERO,
             cache_n: 2,
             every: 1,
@@ -389,6 +416,16 @@ mod tests {
         pool::start().expect("pool starts");
         let (queue, prep, cpu) = pool::run(vec![0, 5]).await; // two images, the second wraps around the corpus
         assert!(prep > 0 && cpu > 0 && queue < prep, "queue {queue} prep {prep} cpu {cpu}");
+    }
+
+    #[tokio::test]
+    async fn emulated_cmm_queues_for_its_lanes() {
+        let c = Config { mode: Mode::Emulate, emu: Duration::from_millis(40), lanes: 2, ..cfg() };
+        let t = Instant::now();
+        let r = futures::future::join_all((0..4).map(|_| emulate(&c, 1))).await;
+        let ms = t.elapsed().as_millis();
+        assert!((80..140).contains(&ms), "4 misses on 2 lanes of 40 ms took {ms} ms");
+        assert_eq!(r.iter().filter(|(q, _)| *q > 30_000).count(), 2, "two waited for a lane: {r:?}");
     }
 
     #[tokio::test]
