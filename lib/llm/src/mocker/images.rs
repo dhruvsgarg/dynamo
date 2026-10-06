@@ -19,6 +19,15 @@
 //!                CMM latency per image + the pool read) on one of `DYN_MOCKER_MM_EMU_LANES` lanes per worker (the
 //!                CMM's 16 cores shared by the prefill workers: 16 / workers; 0 = unlimited, W2-V.1), queueing for a
 //!                lane like rust queues for its threads
+//!       cmm      the CMM, REAL (tok_dynamo.md P11 CMM-Img): the miss's data-URI payload goes into one of this worker's lanes
+//!                in the pool (ABI5, RocketKV tok/mm/src/lanes.rs), `mmsvc serve` (on the CMM's Arm cores, or on x86 as the
+//!                loopback) decodes and processes it and leaves the tensor in the pool; the worker polls the lane's
+//!                completion every `DYN_MOCKER_MM_CMM_POLL_US` (default 100) with a sleep, so the host core is free in
+//!                between. Env: `DYN_MOCKER_MM_CMM_POOL` (/dev/dax0.0 or a shared file), `_BASE` (byte offset of the image
+//!                region, 2 MiB aligned), `_LANES` (lanes this worker owns, default 4), `_CMO` (auto|on|off); lanes are
+//!                claimed with flock files in `DYN_MOCKER_MM_CMM_LOCKDIR` (/dev/shm) so the prefill workers share the 16.
+//!                Corpus as `rust` (DYN_MOCKER_MM_CORPUS / _CLASS); the tensor is never copied back (the GPU reads it from
+//!                the pool: modelled by the encoder wait)
 //!       ideal    nothing (the ceiling)
 //!   4 waits the vision encoder, `DYN_MOCKER_MM_ENC_MS` per miss (A10, modelled; an encode stage ahead of the prefill
 //!     GPU, as Dynamo's E/P/D runs it), in every mode.
@@ -37,6 +46,7 @@ use std::time::{Duration, Instant};
 pub enum Mode {
     Rust,
     Emulate,
+    Cmm,
     Ideal,
 }
 
@@ -60,8 +70,9 @@ pub fn config() -> Option<&'static Config> {
             None | Some("") | Some("off") => return None,
             Some("rust") => Mode::Rust,
             Some("emulate") => Mode::Emulate,
+            Some("cmm") => Mode::Cmm,
             Some("ideal") => Mode::Ideal,
-            Some(o) => panic!("DYN_MOCKER_MM={o}: rust, emulate, ideal or off"),
+            Some(o) => panic!("DYN_MOCKER_MM={o}: rust, emulate, cmm, ideal or off"),
         };
         let toks: Vec<u32> = std::env::var("DYN_MOCKER_MM_TOKENS")
             .expect("DYN_MOCKER_MM needs DYN_MOCKER_MM_TOKENS=start,pad,end,hex0 (w2.py's meta)")
@@ -87,6 +98,9 @@ pub fn config() -> Option<&'static Config> {
         };
         if mode == Mode::Rust {
             pool::start().unwrap_or_else(|e| panic!("DYN_MOCKER_MM=rust: {e}"));
+        }
+        if mode == Mode::Cmm {
+            cmm::start().unwrap_or_else(|e| panic!("DYN_MOCKER_MM=cmm: {e}"));
         }
         tracing::info!(
             mode = ?mode, emu_ms = c.emu.as_secs_f64() * 1e3, emu_lanes = c.lanes, enc_ms = c.enc.as_secs_f64() * 1e3, cache_n = c.cache_n,
@@ -198,6 +212,10 @@ pub async fn before_prefill(c: &Config, tokens: &[u32]) {
                 cpu = r.2;
             }
             Mode::Emulate => (queue, emu) = emulate(c, misses.len()).await,
+            Mode::Cmm => {
+                let r = cmm::run(misses.clone()).await;
+                (queue, prep, cpu, emu) = (r.0, r.1, r.2, r.3); // emu_us = the service's own time per request (its t_end - t_start)
+            }
             Mode::Ideal => {}
         }
         if !c.enc.is_zero() {
@@ -307,6 +325,27 @@ mod pool {
         Ok(Corpus { uris, cfg, model })
     }
 
+    /// The corpus as base64 payloads (the data URI's text after the comma), for the CMM lanes: no processor config needed.
+    pub fn payloads() -> Result<Arc<Vec<Vec<u8>>>, String> {
+        let dir = std::env::var("DYN_MOCKER_MM_CORPUS").map_err(|_| "DYN_MOCKER_MM_CORPUS (a directory of images)")?;
+        let class = std::env::var("DYN_MOCKER_MM_CLASS").unwrap_or_else(|_| "agent720".into());
+        let mut paths: Vec<_> = std::fs::read_dir(&dir)
+            .map_err(|e| format!("{dir}: {e}"))?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with(&format!("{class}-"))))
+            .filter(|p| matches!(p.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase().as_str(), "png" | "jpg" | "jpeg"))
+            .collect();
+        paths.sort();
+        let mut v = Vec::new();
+        for p in &paths {
+            v.push(STANDARD.encode(std::fs::read(p).map_err(|e| format!("{}: {e}", p.display()))?).into_bytes());
+        }
+        if v.is_empty() {
+            return Err(format!("no {class}-* images in {dir}"));
+        }
+        Ok(Arc::new(v))
+    }
+
     pub fn start() -> Result<(), String> {
         let corpus = Arc::new(load()?);
         let n: usize = std::env::var("DYN_MOCKER_MM_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(1).max(1);
@@ -349,6 +388,340 @@ mod pool {
         let (tx, rx) = tokio::sync::oneshot::channel();
         TX.get().expect("pool started").lock().unwrap().send(Job { uids, enq: Instant::now(), tx }).expect("pool alive");
         rx.await.expect("pool answers")
+    }
+}
+
+#[cfg(feature = "mm-routing")]
+mod cmm {
+    //! DYN_MOCKER_MM=cmm: the client half of ABI5 (RocketKV tok/mm/src/lanes.rs holds the protocol and `mmsvc serve` the
+    //! service; the constants below mirror it, and `lane_abi_constants` pins them). One thread per lane this worker owns;
+    //! a job = one request's misses, processed in order on one lane, like `emulate` and `rust`.
+    use std::fs::File;
+    use std::io::Write;
+    use std::os::unix::io::AsRawFd;
+    use std::ptr;
+    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+
+    const MAGIC: u64 = 0x3558_4e4c_4d49_314b;
+    const ABI: u32 = 5;
+    const HDR: usize = 4096;
+    const HUGE: usize = 2 << 20;
+    const LANE_CTL: usize = 4096;
+    const OFF_REQ: usize = 0;
+    const OFF_PARAM: usize = 64;
+    const OFF_DONE: usize = 128;
+    const OFF_STATE: usize = 64;
+    const RESULT_OFF: usize = 256;
+    const RESULT_BYTES: usize = 192;
+
+    #[derive(Clone, Copy)]
+    struct Geometry {
+        lanes: usize,
+        in_cap: usize,
+        out_cap: usize,
+    }
+    impl Geometry {
+        fn stride(&self) -> usize {
+            (LANE_CTL + self.in_cap + self.out_cap).div_ceil(HUGE) * HUGE
+        }
+        fn total(&self) -> usize {
+            HDR.next_multiple_of(HUGE) + self.lanes * self.stride()
+        }
+        fn lane_off(&self, i: usize) -> usize {
+            HDR.next_multiple_of(HUGE) + i * self.stride()
+        }
+    }
+
+    struct Pool {
+        base: *mut u8,
+        len: usize,
+        cmo: bool,
+    }
+    unsafe impl Send for Pool {}
+    unsafe impl Sync for Pool {}
+    impl Pool {
+        fn open(path: &str, off: u64, len: usize, cmo: bool) -> Result<Pool, String> {
+            let f = std::fs::OpenOptions::new().read(true).write(true).open(path).map_err(|e| format!("{path}: {e}"))?;
+            let p = unsafe {
+                libc::mmap(ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, f.as_raw_fd(), off as libc::off_t)
+            };
+            if p == libc::MAP_FAILED {
+                return Err(format!("mmap {path}+{off:#x} ({len} B): {}", std::io::Error::last_os_error()));
+            }
+            Ok(Pool { base: p as *mut u8, len, cmo })
+        }
+        fn at(&self, off: usize) -> *mut u8 {
+            assert!(off < self.len);
+            unsafe { self.base.add(off) }
+        }
+        fn rd64(&self, off: usize) -> u64 {
+            unsafe { ptr::read_volatile(self.at(off) as *const u64) }
+        }
+        fn wr64(&self, off: usize, v: u64) {
+            unsafe { ptr::write_volatile(self.at(off) as *mut u64, v) }
+        }
+        /// Write back and drop the lines of [off, off+n): what a writer owes before the CMM reads, and a reader before
+        /// it reads what the CMM wrote (clflushopt: CLFLUSH serialises every line against the device, 66 MB/s, S2f).
+        fn sync(&self, off: usize, n: usize) {
+            if !self.cmo {
+                return;
+            }
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                let mut a = (self.at(off) as usize) & !63;
+                let e = self.at(off) as usize + n.max(1);
+                while a < e {
+                    std::arch::asm!("clflushopt [{0}]", in(reg) a, options(nostack, preserves_flags));
+                    a += 64;
+                }
+                std::arch::asm!("mfence", options(nostack, preserves_flags));
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                let _ = (off, n);
+                std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        /// A bulk write that leaves nothing in this core's cache (non-temporal stores), so the CMM can read it.
+        fn put(&self, off: usize, src: &[u8]) {
+            let dst = self.at(off);
+            assert!(off + src.len() <= self.len);
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                use std::arch::x86_64::*;
+                let mut i = 0;
+                if (dst as usize) & 15 == 0 {
+                    while i + 64 <= src.len() {
+                        let s = src.as_ptr().add(i) as *const __m128i;
+                        let d = dst.add(i) as *mut __m128i;
+                        _mm_stream_si128(d, _mm_loadu_si128(s));
+                        _mm_stream_si128(d.add(1), _mm_loadu_si128(s.add(1)));
+                        _mm_stream_si128(d.add(2), _mm_loadu_si128(s.add(2)));
+                        _mm_stream_si128(d.add(3), _mm_loadu_si128(s.add(3)));
+                        i += 64;
+                    }
+                }
+                if i < src.len() {
+                    ptr::copy_nonoverlapping(src.as_ptr().add(i), dst.add(i), src.len() - i);
+                }
+                _mm_sfence();
+                if i < src.len() {
+                    self.sync(off + i, src.len() - i);
+                }
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            unsafe {
+                ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len());
+                self.sync(off, src.len());
+            }
+        }
+    }
+
+    fn thread_cpu_us() -> u64 {
+        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+        ts.tv_sec as u64 * 1_000_000 + ts.tv_nsec as u64 / 1000
+    }
+
+    struct Job {
+        uids: Vec<u32>,
+        enq: Instant,
+        tx: tokio::sync::oneshot::Sender<(u64, u64, u64, u64)>,
+    }
+
+    static TX: OnceLock<Mutex<mpsc::Sender<Job>>> = OnceLock::new();
+    static LOCKS: OnceLock<Vec<File>> = OnceLock::new();
+
+    /// The first `want` lanes of `total` that no other worker holds (flock, released when this process exits).
+    fn claim(dir: &str, total: usize, want: usize) -> Result<Vec<usize>, String> {
+        let (mut got, mut files) = (Vec::new(), Vec::new());
+        for i in 0..total {
+            if got.len() == want {
+                break;
+            }
+            let f = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(format!("{dir}/k1img-lane-{i}.lock"))
+                .map_err(|e| format!("lane lock {dir}/k1img-lane-{i}.lock: {e}"))?;
+            if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                got.push(i);
+                files.push(f);
+            }
+        }
+        if got.len() < want {
+            return Err(format!("only {} of {want} lanes free (of {total}): the other workers hold the rest", got.len()));
+        }
+        LOCKS.set(files).map_err(|_| "lanes claimed twice".to_string())?;
+        Ok(got)
+    }
+
+    pub fn start() -> Result<(), String> {
+        let path = std::env::var("DYN_MOCKER_MM_CMM_POOL").map_err(|_| "DYN_MOCKER_MM_CMM_POOL (/dev/dax0.0 or a shared file)")?;
+        let base: u64 = std::env::var("DYN_MOCKER_MM_CMM_BASE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let want: usize = std::env::var("DYN_MOCKER_MM_CMM_LANES").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+        let total: usize = std::env::var("DYN_MOCKER_MM_CMM_LANES_TOTAL").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
+        let dir = std::env::var("DYN_MOCKER_MM_CMM_LOCKDIR").unwrap_or_else(|_| "/dev/shm".into());
+        let poll = Duration::from_micros(std::env::var("DYN_MOCKER_MM_CMM_POLL_US").ok().and_then(|v| v.parse().ok()).unwrap_or(100));
+        let cmo = match std::env::var("DYN_MOCKER_MM_CMM_CMO").unwrap_or_else(|_| "auto".into()).as_str() {
+            "on" => true,
+            "off" => false,
+            _ => path.starts_with("/dev/"),
+        };
+        // the service must be up: header, ABI, state 1 (it may still be creating the pool file); then map the lanes
+        let t0 = Instant::now();
+        let g = loop {
+            match Pool::open(&path, base, HUGE, cmo) {
+                Ok(probe) => {
+                    probe.sync(0, 64);
+                    if probe.rd64(0) == MAGIC {
+                        probe.sync(0, 128);
+                        let ab = probe.rd64(8);
+                        probe.sync(OFF_STATE, 64);
+                        if (ab & 0xffff_ffff) as u32 == ABI && probe.rd64(OFF_STATE) == 1 {
+                            break Geometry { lanes: (ab >> 32) as usize, in_cap: probe.rd64(24) as usize, out_cap: probe.rd64(32) as usize };
+                        }
+                    }
+                }
+                Err(e) if t0.elapsed().as_secs() > 60 => return Err(e),
+                Err(_) => {}
+            }
+            if t0.elapsed().as_secs() > 60 {
+                return Err(format!("no ready ABI5 service at {path}+{base:#x} (mmsvc serve --pool {path} --base {base})"));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        if g.lanes != total {
+            return Err(format!("the service has {} lanes, DYN_MOCKER_MM_CMM_LANES_TOTAL says {total}", g.lanes));
+        }
+        let mine = claim(&dir, total, want)?;
+        let pool = Arc::new(Pool::open(&path, base, g.total(), cmo)?);
+        let uris = super::pool::payloads()?;
+        let (tx, rx) = mpsc::channel::<Job>();
+        let rx = Arc::new(Mutex::new(rx));
+        for &lane in &mine {
+            let (rx, pool, uris) = (rx.clone(), pool.clone(), uris.clone());
+            std::thread::Builder::new()
+                .name(format!("mm-cmm-{lane}"))
+                .spawn(move || {
+                    let lo = g.lane_off(lane);
+                    loop {
+                        let job = match rx.lock().unwrap().recv() {
+                            Ok(j) => j,
+                            Err(_) => return,
+                        };
+                        let (t, c) = (Instant::now(), thread_cpu_us());
+                        let queue = t.duration_since(job.enq).as_micros() as u64;
+                        let mut svc_ns = 0u64;
+                        for u in &job.uids {
+                            let payload = &uris[*u as usize % uris.len()];
+                            assert!(payload.len() <= g.in_cap, "payload {} B > the lane's in_cap {}", payload.len(), g.in_cap);
+                            pool.sync(lo + OFF_REQ, 64);
+                            let seq = pool.rd64(lo + OFF_REQ) + 1;
+                            pool.put(lo + LANE_CTL, payload);
+                            pool.wr64(lo + OFF_PARAM, payload.len() as u64);
+                            pool.wr64(lo + OFF_PARAM + 8, 0);
+                            pool.wr64(lo + OFF_PARAM + 16, 0);
+                            pool.sync(lo + OFF_PARAM, 64);
+                            pool.wr64(lo + OFF_REQ, seq);
+                            pool.sync(lo + OFF_REQ, 64);
+                            loop {
+                                pool.sync(lo + OFF_DONE, 64);
+                                if pool.rd64(lo + OFF_DONE) >= seq {
+                                    break;
+                                }
+                                std::thread::sleep(poll);
+                            }
+                            pool.sync(lo + RESULT_OFF, RESULT_BYTES);
+                            let status = pool.rd64(lo + RESULT_OFF) as u32 as i32;
+                            assert_eq!(status, 0, "mmsvc lane {lane}: image {u} status {status}");
+                            svc_ns += pool.rd64(lo + RESULT_OFF + 88) - pool.rd64(lo + RESULT_OFF + 80); // t_end - t_start
+                        }
+                        let _ = job.tx.send((queue, t.elapsed().as_micros() as u64, thread_cpu_us() - c, svc_ns / 1000));
+                    }
+                })
+                .map_err(|e| e.to_string())?;
+        }
+        let _ = std::io::stderr().flush();
+        tracing::info!(pool = %path, base, lanes = ?mine, poll_us = poll.as_micros() as u64, cmo, "mocker images: CMM lanes claimed (ABI5)");
+        TX.set(Mutex::new(tx)).map_err(|_| "cmm lanes started twice".to_string())
+    }
+
+    /// (queue, submit -> done wall, this thread's CPU, the service's own time) in us for one request's misses.
+    pub async fn run(uids: Vec<u32>) -> (u64, u64, u64, u64) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        TX.get().expect("cmm lanes started").lock().unwrap().send(Job { uids, enq: Instant::now(), tx }).expect("lane threads alive");
+        rx.await.expect("a lane answers")
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// The real client against the real service over a file pool (the loopback): RK_MMSVC=<RocketKV>/tok/mm/target/release/mmsvc
+        /// RK_MM_CORPUS=<RocketKV>/tok/mm/corpus RK_MM_CFG=<RocketKV>/tok/mm/cfg/qwen3-vl-cap1280-bicubic.json; skipped without them.
+        /// One test per process: `start()` is a OnceLock.
+        #[tokio::test]
+        async fn lanes_roundtrip_against_mmsvc() {
+            let (Ok(bin), Ok(dir), Ok(cfg)) = (std::env::var("RK_MMSVC"), std::env::var("RK_MM_CORPUS"), std::env::var("RK_MM_CFG")) else {
+                eprintln!("skipped: set RK_MMSVC, RK_MM_CORPUS and RK_MM_CFG");
+                return;
+            };
+            let pool = format!("/tmp/rk-mmsvc-test-{}.pool", std::process::id());
+            let lockdir = format!("/tmp/rk-mmsvc-locks-{}", std::process::id());
+            std::fs::create_dir_all(&lockdir).unwrap();
+            let mut svc = std::process::Command::new(bin)
+                .args(["serve", "--pool", &pool, "--base", "0", "--create", "--cmo", "off", "--cfg", &cfg, "--lanes", "4", "--report-s", "0"])
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .expect("mmsvc starts");
+            unsafe {
+                std::env::set_var("DYN_MOCKER_MM_CMM_POOL", &pool);
+                std::env::set_var("DYN_MOCKER_MM_CMM_BASE", "0");
+                std::env::set_var("DYN_MOCKER_MM_CMM_LANES", "2");
+                std::env::set_var("DYN_MOCKER_MM_CMM_LANES_TOTAL", "4");
+                std::env::set_var("DYN_MOCKER_MM_CMM_CMO", "off");
+                std::env::set_var("DYN_MOCKER_MM_CMM_LOCKDIR", &lockdir);
+                std::env::set_var("DYN_MOCKER_MM_CORPUS", dir);
+                std::env::set_var("DYN_MOCKER_MM_CLASS", "shot1080");
+            }
+            let _ = cfg;
+            start().expect("the lanes are claimed against the running service");
+            // two requests of two images each: the lanes of this worker serve them in parallel
+            let (a, b) = tokio::join!(run(vec![0, 1]), run(vec![2, 3]));
+            for (queue, wall, host_cpu, svc_us) in [a, b] {
+                assert!(wall > 0 && svc_us > 0, "the service worked: wall {wall} us, service {svc_us} us");
+                assert!(wall >= svc_us, "wall {wall} < the service's own time {svc_us}");
+                assert!(host_cpu < wall, "the client polls with sleeps, it does not spin: cpu {host_cpu} us of {wall} us (queue {queue})");
+            }
+            unsafe { libc::kill(svc.id() as i32, libc::SIGTERM) };
+            let _ = svc.wait();
+            let _ = std::fs::remove_file(&pool);
+        }
+
+        /// The constants this client mirrors from tok/mm/src/lanes.rs: a lane's byte layout must not drift.
+        #[test]
+        fn lane_abi_constants() {
+            let g = Geometry { lanes: 16, in_cap: 8 << 20, out_cap: 64 << 20 };
+            assert_eq!(MAGIC, 0x3558_4e4c_4d49_314b);
+            assert_eq!((HDR, LANE_CTL, OFF_REQ, OFF_PARAM, OFF_DONE, OFF_STATE, RESULT_OFF, RESULT_BYTES), (4096, 4096, 0, 64, 128, 64, 256, 192));
+            assert_eq!(g.stride(), 74 << 20);
+            assert_eq!(g.lane_off(0), 2 << 20);
+            assert_eq!(g.total(), (2 << 20) + 16 * (74 << 20));
+        }
+    }
+}
+
+#[cfg(not(feature = "mm-routing"))]
+mod cmm {
+    pub fn start() -> Result<(), String> {
+        Err("this build has no mm-routing (tok/dyn/build.sh dynamo)".into())
+    }
+    pub async fn run(_uids: Vec<u32>) -> (u64, u64, u64, u64) {
+        unreachable!("start() refused")
     }
 }
 
