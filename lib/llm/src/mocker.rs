@@ -1234,9 +1234,11 @@ pub async fn make_mocker_engine(
 /// timed as stock, while the core stays busy (its CPU is the engine's, cpu/s ~ 1.0) and at its clock (RocketKV TD18).
 fn hold_core() {
     let spawned = std::thread::Builder::new().name("engine-spin".into()).spawn(|| {
-        let p = libc::sched_param { sched_priority: 0 };
-        // pid 0 = this thread on Linux
-        let idle = unsafe { libc::sched_setscheduler(0, libc::SCHED_IDLE, &p) } == 0;
+        // pid 0 = this thread on Linux; elsewhere (a laptop build) no SCHED_IDLE: the thread only spins
+        #[cfg(target_os = "linux")]
+        let idle = unsafe { libc::sched_setscheduler(0, libc::SCHED_IDLE, &libc::sched_param { sched_priority: 0 }) } == 0;
+        #[cfg(not(target_os = "linux"))]
+        let idle = false;
         tracing::info!(sched_idle = idle, "mocker engine holds its core (DYN_MOCKER_GPU_WAIT=hold): engine-spin on");
         loop {
             std::hint::spin_loop();
@@ -1275,6 +1277,7 @@ mod tests {
     }
 
     /// RocketKV W2-V.3 (M1): `hold` starts a thread named engine-spin that runs at SCHED_IDLE (it yields to the engine).
+    #[cfg(target_os = "linux")]
     #[test]
     fn hold_core_spins_at_sched_idle() {
         hold_core();

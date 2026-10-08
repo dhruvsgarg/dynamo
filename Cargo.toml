@@ -200,3 +200,8 @@ lto = "thin"
 inherits = "release"
 debug = true
 strip = false
+
+# RocketKV (tok_dynamo.md §4.5): llm-multimodal 1.7.0 vendored in the RocketKV superproject, unmodified except O2 behind its
+# feature `rocketkv-exact-patches` (third-party/llm-multimodal/ROCKETKV.md), which lib/llm turns on
+[patch.crates-io]
+llm-multimodal = { path = "../llm-multimodal" }

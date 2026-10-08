@@ -113,3 +113,7 @@ dynamo-llm = { path = "../../llm", default-features = false }
 inherits = "release"
 debug = true
 strip = false
+
+# RocketKV (tok_dynamo.md §4.5): as the workspace root's: llm-multimodal with O2 (third-party/llm-multimodal/ROCKETKV.md)
+[patch.crates-io]
+llm-multimodal = { path = "../../../../llm-multimodal" }

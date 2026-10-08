@@ -36,13 +36,15 @@
 //! inherit the process's cores (W2-V.1 / V.2).
 //! Telemetry (cumulative, every `DYN_MOCKER_MM_EVERY` requests; nothing per request is logged):
 //!   `mmwork w=<pid> mode= threads= reqs= imgs= miss= queue_us= prep_us= cpu_us= emu_us= enc_us= wait_us= idle_us= starved_us=
-//!    img_us= total_us= h=<log2 ms buckets>`
+//!    img_us= total_us= cold= cold_us= warm= warm_us= h=<log2 ms buckets>`
 //! where threads = the worker's concurrency for its misses (rust: processor threads; cmm: lanes it owns; emulate: lanes,
 //! 0 = unlimited; ideal: 0) (W2-V.3, M3: equal concurrency, AP4);
 //! where wait = what the request waited for steps 3 + 4, h its histogram (bucket i: wait < 2^i ms, i = 0..15); idle /
 //! starved / img (W2-V.2, dynamo_mocker::engine_cpu::starve, needs DYN_MOCKER_ENGINE_CPU=1): the worker's GPU idle,
 //! idle while >= 1 request was in image work (the GPU waiting on the image work), >= 1 request in image work, and the
-//! time since the first such event.
+//! time since the first such event; cold / warm (W2-V.3, C33, `rust` only): the misses processed by a thread that had been
+//! idle >= `DYN_MOCKER_MM_COLD_MS` (default 1000) before the job / the others, and their processing wall (an idle x86 core
+//! clocks down, TD18: the check that the image cores are warm).
 use std::collections::VecDeque;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -67,6 +69,7 @@ pub struct Config {
     cache_n: usize,
     every: u64,
     threads: u64,
+    cold: Duration,
 }
 
 /// `DYN_MOCKER_MM_CPUS` as a list of cpus (`a,b,c-d`); empty when unset.
@@ -88,6 +91,7 @@ fn parse_cpus(spec: &str) -> Vec<usize> {
 }
 
 /// Pin the calling thread to `cpus` (none = leave it where it is); false if the kernel refused.
+#[cfg(target_os = "linux")]
 fn pin_thread(cpus: &[usize]) -> bool {
     if cpus.is_empty() {
         return true;
@@ -99,6 +103,12 @@ fn pin_thread(cpus: &[usize]) -> bool {
         }
         libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) == 0
     }
+}
+
+/// Off Linux (a laptop build, tests only) a thread cannot be pinned: only an empty list succeeds.
+#[cfg(not(target_os = "linux"))]
+fn pin_thread(cpus: &[usize]) -> bool {
+    cpus.is_empty()
 }
 
 pub fn config() -> Option<&'static Config> {
@@ -133,6 +143,7 @@ pub fn config() -> Option<&'static Config> {
             enc: ms("DYN_MOCKER_MM_ENC_MS", 0.0),
             cache_n: num("DYN_MOCKER_MM_CACHE_N", 190) as usize,
             every: num("DYN_MOCKER_MM_EVERY", 16).max(1),
+            cold: ms("DYN_MOCKER_MM_COLD_MS", 1000.0),
             threads: match mode {
                 Mode::Rust => num("DYN_MOCKER_MM_THREADS", 1).max(1),
                 Mode::Cmm => num("DYN_MOCKER_MM_CMM_LANES", 4),
@@ -197,7 +208,24 @@ struct Stats {
     emu_us: u64,
     enc_us: u64,
     wait_us: u64,
+    cold: u64,
+    cold_us: u64,
+    warm: u64,
+    warm_us: u64,
     h: [u64; 16],
+}
+
+impl Stats {
+    /// C33: a `rust` job's misses go to `cold` when its thread had idled >= `cold` before it, else to `warm`.
+    fn idle_split(&mut self, cold: Duration, idle_us: u64, misses: u64, prep_us: u64) {
+        if idle_us >= cold.as_micros() as u64 {
+            self.cold += misses;
+            self.cold_us += prep_us;
+        } else {
+            self.warm += misses;
+            self.warm_us += prep_us;
+        }
+    }
 }
 
 struct Worker {
@@ -246,7 +274,7 @@ pub async fn before_prefill(c: &Config, tokens: &[u32]) {
         }
         m
     };
-    let (mut queue, mut prep, mut cpu, mut emu) = (0u64, 0u64, 0u64, 0u64);
+    let (mut queue, mut prep, mut cpu, mut emu, mut idle_before) = (0u64, 0u64, 0u64, 0u64, None);
     if !misses.is_empty() {
         match c.mode {
             Mode::Rust => {
@@ -254,6 +282,7 @@ pub async fn before_prefill(c: &Config, tokens: &[u32]) {
                 queue = r.0;
                 prep = r.1;
                 cpu = r.2;
+                idle_before = Some(r.3);
             }
             Mode::Emulate => (queue, emu) = emulate(c, misses.len()).await,
             Mode::Cmm => {
@@ -280,13 +309,16 @@ pub async fn before_prefill(c: &Config, tokens: &[u32]) {
     s.emu_us += emu;
     s.enc_us += enc;
     s.wait_us += wait;
+    if let Some(idle) = idle_before {
+        s.idle_split(c.cold, idle, misses.len() as u64, prep);
+    }
     let b = (64 - (wait / 1000).leading_zeros()) as usize; // wait < 2^b ms
     s.h[b.min(15)] += 1;
     if s.reqs % c.every == 0 {
         let h: Vec<String> = s.h.iter().map(|x| x.to_string()).collect();
         let (idle, starved, img, total) = dynamo_mocker::engine_cpu::starve::snapshot();
         tracing::info!(
-            "mmwork w={} mode={:?} threads={} reqs={} imgs={} miss={} queue_us={} prep_us={} cpu_us={} emu_us={} enc_us={} wait_us={} idle_us={} starved_us={} img_us={} total_us={} h={}",
+            "mmwork w={} mode={:?} threads={} reqs={} imgs={} miss={} queue_us={} prep_us={} cpu_us={} emu_us={} enc_us={} wait_us={} idle_us={} starved_us={} img_us={} total_us={} cold={} cold_us={} warm={} warm_us={} h={}",
             std::process::id(),
             c.mode,
             c.threads,
@@ -303,6 +335,10 @@ pub async fn before_prefill(c: &Config, tokens: &[u32]) {
             starved,
             img,
             total,
+            s.cold,
+            s.cold_us,
+            s.warm,
+            s.warm_us,
             h.join(",")
         );
     }
@@ -322,7 +358,7 @@ mod pool {
     struct Job {
         uids: Vec<u32>,
         enq: Instant,
-        tx: tokio::sync::oneshot::Sender<(u64, u64, u64)>,
+        tx: tokio::sync::oneshot::Sender<(u64, u64, u64, u64)>,
     }
 
     struct Corpus {
@@ -405,6 +441,7 @@ mod pool {
                     assert!(super::pin_thread(&cpus), "mm-prep-{i}: cannot pin to DYN_MOCKER_MM_CPUS {cpus:?}");
                     let reg = VisionProcessorRegistry::with_defaults();
                     let p = reg.find(&corpus.model, None).expect("checked at load");
+                    let mut last = Instant::now();
                     loop {
                         let job = match rx.lock().unwrap().recv() {
                             Ok(j) => j,
@@ -412,6 +449,7 @@ mod pool {
                         };
                         let (t, c) = (Instant::now(), thread_cpu_us());
                         let queue = t.duration_since(job.enq).as_micros() as u64;
+                        let idle = t.duration_since(last).as_micros() as u64; // C33: how long this thread sat idle
                         for u in &job.uids {
                             let uri = &corpus.uris[*u as usize % corpus.uris.len()];
                             let bytes = STANDARD.decode(&uri[uri.find(',').unwrap() + 1..]).expect("corpus base64");
@@ -422,7 +460,8 @@ mod pool {
                                 .expect("corpus image decodes");
                             std::hint::black_box(p.preprocess(std::slice::from_ref(&img), &corpus.cfg).expect("preprocess"));
                         }
-                        let _ = job.tx.send((queue, t.elapsed().as_micros() as u64, thread_cpu_us() - c));
+                        last = Instant::now();
+                        let _ = job.tx.send((queue, last.duration_since(t).as_micros() as u64, thread_cpu_us() - c, idle));
                     }
                 })
                 .map_err(|e| e.to_string())?;
@@ -430,8 +469,8 @@ mod pool {
         TX.set(Mutex::new(tx)).map_err(|_| "image pool started twice".to_string())
     }
 
-    /// (queue, processing wall, processing CPU) in us for one request's misses.
-    pub async fn run(uids: Vec<u32>) -> (u64, u64, u64) {
+    /// (queue, processing wall, processing CPU, the thread's idle time before the job) in us for one request's misses.
+    pub async fn run(uids: Vec<u32>) -> (u64, u64, u64, u64) {
         let (tx, rx) = tokio::sync::oneshot::channel();
         TX.get().expect("pool started").lock().unwrap().send(Job { uids, enq: Instant::now(), tx }).expect("pool alive");
         rx.await.expect("pool answers")
@@ -779,7 +818,7 @@ mod pool {
     pub fn start() -> Result<(), String> {
         Err("this build has no llm-multimodal: build the bindings with --features mm-routing (tok/dyn/build.sh dynamo)".into())
     }
-    pub async fn run(_uids: Vec<u32>) -> (u64, u64, u64) {
+    pub async fn run(_uids: Vec<u32>) -> (u64, u64, u64, u64) {
         unreachable!("start() refused")
     }
 }
@@ -801,6 +840,7 @@ mod tests {
             cache_n: 2,
             every: 1,
             threads: 0,
+            cold: Duration::from_millis(1000),
         }
     }
 
@@ -812,6 +852,7 @@ mod tests {
         v
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn mm_cpus_parse_and_pin() {
         assert_eq!(parse_cpus("40,41"), vec![40, 41]);
@@ -835,6 +876,16 @@ mod tests {
         .join()
         .unwrap();
         assert_eq!(got, vec![mine]);
+    }
+
+    #[test]
+    fn c33_splits_misses_by_idle_before() {
+        let mut s = Stats::default();
+        let cold = Duration::from_millis(1000);
+        s.idle_split(cold, 1_500_000, 1, 40_000); // idle 1.5 s: cold
+        s.idle_split(cold, 999_999, 2, 60_000); // just under: warm
+        s.idle_split(cold, 0, 1, 30_000);
+        assert_eq!((s.cold, s.cold_us, s.warm, s.warm_us), (1, 40_000, 3, 90_000));
     }
 
     #[test]
@@ -862,7 +913,7 @@ mod tests {
             std::env::set_var("DYN_MOCKER_MM_CLASS", "shot1080");
         }
         pool::start().expect("pool starts");
-        let (queue, prep, cpu) = pool::run(vec![0, 5]).await; // two images, the second wraps around the corpus
+        let (queue, prep, cpu, _idle) = pool::run(vec![0, 5]).await; // two images, the second wraps around the corpus
         assert!(prep > 0 && cpu > 0 && queue < prep, "queue {queue} prep {prep} cpu {cpu}");
     }
 
