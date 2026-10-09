@@ -36,15 +36,21 @@
 //! inherit the process's cores (W2-V.1 / V.2).
 //! Telemetry (cumulative, every `DYN_MOCKER_MM_EVERY` requests; nothing per request is logged):
 //!   `mmwork w=<pid> mode= threads= reqs= imgs= miss= queue_us= prep_us= cpu_us= emu_us= enc_us= wait_us= idle_us= starved_us=
-//!    img_us= total_us= cold= cold_us= warm= warm_us= h=<log2 ms buckets>`
+//!    img_us= total_us= cold= cold_us= cold_cpu_us= warm= warm_us= warm_cpu_us= h=<log2 ms buckets>`
 //! where threads = the worker's concurrency for its misses (rust: processor threads; cmm: lanes it owns; emulate: lanes,
 //! 0 = unlimited; ideal: 0) (W2-V.3, M3: equal concurrency, AP4);
 //! where wait = what the request waited for steps 3 + 4, h its histogram (bucket i: wait < 2^i ms, i = 0..15); idle /
 //! starved / img (W2-V.2, dynamo_mocker::engine_cpu::starve, needs DYN_MOCKER_ENGINE_CPU=1): the worker's GPU idle,
 //! idle while >= 1 request was in image work (the GPU waiting on the image work), >= 1 request in image work, and the
 //! time since the first such event; cold / warm (W2-V.3, C33, `rust` only): the misses processed by a thread that had been
-//! idle >= `DYN_MOCKER_MM_COLD_MS` (default 1000) before the job / the others, and their processing wall (an idle x86 core
-//! clocks down, TD18: the check that the image cores are warm).
+//! idle >= `DYN_MOCKER_MM_COLD_MS` (default 1000) before the job / the others, and their processing wall and CPU (an idle
+//! x86 core clocks down, TD18: the CPU per miss grows with it; the wall also holds time-slicing with other threads).
+//! Prewarm (`rust`, 10-09): before the worker serves, each image thread preprocesses `DYN_MOCKER_MM_PREWARM` (default 2)
+//! corpus images, as a server's startup profile run does (vLLM runs its processor on dummy images); `pool::start` returns
+//! once every thread is done, so no measured request pays the threads' one-time setup. Each thread logs it once:
+//!   `mmprewarm w=<pid> t=<thread> n= first_us= first_cpu_us= last_us= last_cpu_us=` (wall and CPU of its first and last
+//!   prewarm image: first / last = the one-time setup, the cold start; 0 = no prewarm, the first job then counts in neither
+//!   cold nor warm: its idle would be the time since spawn).
 use std::collections::VecDeque;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -210,20 +216,24 @@ struct Stats {
     wait_us: u64,
     cold: u64,
     cold_us: u64,
+    cold_cpu_us: u64,
     warm: u64,
     warm_us: u64,
+    warm_cpu_us: u64,
     h: [u64; 16],
 }
 
 impl Stats {
     /// C33: a `rust` job's misses go to `cold` when its thread had idled >= `cold` before it, else to `warm`.
-    fn idle_split(&mut self, cold: Duration, idle_us: u64, misses: u64, prep_us: u64) {
+    fn idle_split(&mut self, cold: Duration, idle_us: u64, misses: u64, prep_us: u64, cpu_us: u64) {
         if idle_us >= cold.as_micros() as u64 {
             self.cold += misses;
             self.cold_us += prep_us;
+            self.cold_cpu_us += cpu_us;
         } else {
             self.warm += misses;
             self.warm_us += prep_us;
+            self.warm_cpu_us += cpu_us;
         }
     }
 }
@@ -282,7 +292,7 @@ pub async fn before_prefill(c: &Config, tokens: &[u32]) {
                 queue = r.0;
                 prep = r.1;
                 cpu = r.2;
-                idle_before = Some(r.3);
+                idle_before = r.3;
             }
             Mode::Emulate => (queue, emu) = emulate(c, misses.len()).await,
             Mode::Cmm => {
@@ -310,7 +320,7 @@ pub async fn before_prefill(c: &Config, tokens: &[u32]) {
     s.enc_us += enc;
     s.wait_us += wait;
     if let Some(idle) = idle_before {
-        s.idle_split(c.cold, idle, misses.len() as u64, prep);
+        s.idle_split(c.cold, idle, misses.len() as u64, prep, cpu);
     }
     let b = (64 - (wait / 1000).leading_zeros()) as usize; // wait < 2^b ms
     s.h[b.min(15)] += 1;
@@ -318,7 +328,7 @@ pub async fn before_prefill(c: &Config, tokens: &[u32]) {
         let h: Vec<String> = s.h.iter().map(|x| x.to_string()).collect();
         let (idle, starved, img, total) = dynamo_mocker::engine_cpu::starve::snapshot();
         tracing::info!(
-            "mmwork w={} mode={:?} threads={} reqs={} imgs={} miss={} queue_us={} prep_us={} cpu_us={} emu_us={} enc_us={} wait_us={} idle_us={} starved_us={} img_us={} total_us={} cold={} cold_us={} warm={} warm_us={} h={}",
+            "mmwork w={} mode={:?} threads={} reqs={} imgs={} miss={} queue_us={} prep_us={} cpu_us={} emu_us={} enc_us={} wait_us={} idle_us={} starved_us={} img_us={} total_us={} cold={} cold_us={} cold_cpu_us={} warm={} warm_us={} warm_cpu_us={} h={}",
             std::process::id(),
             c.mode,
             c.threads,
@@ -337,8 +347,10 @@ pub async fn before_prefill(c: &Config, tokens: &[u32]) {
             total,
             s.cold,
             s.cold_us,
+            s.cold_cpu_us,
             s.warm,
             s.warm_us,
+            s.warm_cpu_us,
             h.join(",")
         );
     }
@@ -358,7 +370,7 @@ mod pool {
     struct Job {
         uids: Vec<u32>,
         enq: Instant,
-        tx: tokio::sync::oneshot::Sender<(u64, u64, u64, u64)>,
+        tx: tokio::sync::oneshot::Sender<(u64, u64, u64, Option<u64>)>,
     }
 
     struct Corpus {
@@ -431,17 +443,51 @@ mod pool {
         let corpus = Arc::new(load()?);
         let n: usize = std::env::var("DYN_MOCKER_MM_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(1).max(1);
         let cpus = Arc::new(super::mm_cpus());
+        let prewarm: usize = std::env::var("DYN_MOCKER_MM_PREWARM").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
         let (tx, rx) = mpsc::channel::<Job>();
         let rx = Arc::new(Mutex::new(rx));
+        let (ready_tx, ready_rx) = mpsc::channel::<()>();
         for i in 0..n {
-            let (rx, corpus, cpus) = (rx.clone(), corpus.clone(), cpus.clone());
+            let (rx, corpus, cpus, ready) = (rx.clone(), corpus.clone(), cpus.clone(), ready_tx.clone());
             std::thread::Builder::new()
                 .name(format!("mm-prep-{i}"))
                 .spawn(move || {
                     assert!(super::pin_thread(&cpus), "mm-prep-{i}: cannot pin to DYN_MOCKER_MM_CPUS {cpus:?}");
                     let reg = VisionProcessorRegistry::with_defaults();
                     let p = reg.find(&corpus.model, None).expect("checked at load");
-                    let mut last = Instant::now();
+                    let prep = |u: usize| {
+                        let uri = &corpus.uris[u % corpus.uris.len()];
+                        let bytes = STANDARD.decode(&uri[uri.find(',').unwrap() + 1..]).expect("corpus base64");
+                        let img = image::ImageReader::new(Cursor::new(&bytes))
+                            .with_guessed_format()
+                            .expect("corpus image")
+                            .decode()
+                            .expect("corpus image decodes");
+                        std::hint::black_box(p.preprocess(std::slice::from_ref(&img), &corpus.cfg).expect("preprocess"));
+                    };
+                    let mut last: Option<Instant> = None; // C33: no idle before the thread's first job
+                    let mut first = (0, 0);
+                    for k in 0..prewarm {
+                        let (t, c) = (Instant::now(), thread_cpu_us());
+                        prep(i * prewarm + k); // different images per thread, as requests bring
+                        let done = Instant::now();
+                        let x = (done.duration_since(t).as_micros() as u64, thread_cpu_us() - c);
+                        if k == 0 {
+                            first = x;
+                        }
+                        if k + 1 == prewarm {
+                            tracing::info!(
+                                "mmprewarm w={} t={i} n={prewarm} first_us={} first_cpu_us={} last_us={} last_cpu_us={}",
+                                std::process::id(),
+                                first.0,
+                                first.1,
+                                x.0,
+                                x.1
+                            );
+                        }
+                        last = Some(done);
+                    }
+                    drop(ready); // pool::start waits for every thread's prewarm
                     loop {
                         let job = match rx.lock().unwrap().recv() {
                             Ok(j) => j,
@@ -449,28 +495,27 @@ mod pool {
                         };
                         let (t, c) = (Instant::now(), thread_cpu_us());
                         let queue = t.duration_since(job.enq).as_micros() as u64;
-                        let idle = t.duration_since(last).as_micros() as u64; // C33: how long this thread sat idle
+                        let idle = last.map(|l| t.duration_since(l).as_micros() as u64); // C33: how long this thread sat idle
                         for u in &job.uids {
-                            let uri = &corpus.uris[*u as usize % corpus.uris.len()];
-                            let bytes = STANDARD.decode(&uri[uri.find(',').unwrap() + 1..]).expect("corpus base64");
-                            let img = image::ImageReader::new(Cursor::new(&bytes))
-                                .with_guessed_format()
-                                .expect("corpus image")
-                                .decode()
-                                .expect("corpus image decodes");
-                            std::hint::black_box(p.preprocess(std::slice::from_ref(&img), &corpus.cfg).expect("preprocess"));
+                            prep(*u as usize);
                         }
-                        last = Instant::now();
-                        let _ = job.tx.send((queue, last.duration_since(t).as_micros() as u64, thread_cpu_us() - c, idle));
+                        let done = Instant::now();
+                        last = Some(done);
+                        let _ = job.tx.send((queue, done.duration_since(t).as_micros() as u64, thread_cpu_us() - c, idle));
                     }
                 })
                 .map_err(|e| e.to_string())?;
         }
+        drop(ready_tx);
+        let t = Instant::now();
+        let _ = ready_rx.recv(); // Err once every thread dropped its sender: all prewarmed
+        tracing::info!(threads = n, prewarm, wall_ms = t.elapsed().as_millis() as u64, "mocker images: image threads prewarmed");
         TX.set(Mutex::new(tx)).map_err(|_| "image pool started twice".to_string())
     }
 
-    /// (queue, processing wall, processing CPU, the thread's idle time before the job) in us for one request's misses.
-    pub async fn run(uids: Vec<u32>) -> (u64, u64, u64, u64) {
+    /// (queue, processing wall, processing CPU, the thread's idle time before the job: None on its first) in us for one
+    /// request's misses.
+    pub async fn run(uids: Vec<u32>) -> (u64, u64, u64, Option<u64>) {
         let (tx, rx) = tokio::sync::oneshot::channel();
         TX.get().expect("pool started").lock().unwrap().send(Job { uids, enq: Instant::now(), tx }).expect("pool alive");
         rx.await.expect("pool answers")
@@ -882,10 +927,11 @@ mod tests {
     fn c33_splits_misses_by_idle_before() {
         let mut s = Stats::default();
         let cold = Duration::from_millis(1000);
-        s.idle_split(cold, 1_500_000, 1, 40_000); // idle 1.5 s: cold
-        s.idle_split(cold, 999_999, 2, 60_000); // just under: warm
-        s.idle_split(cold, 0, 1, 30_000);
-        assert_eq!((s.cold, s.cold_us, s.warm, s.warm_us), (1, 40_000, 3, 90_000));
+        s.idle_split(cold, 1_500_000, 1, 40_000, 35_000); // idle 1.5 s: cold
+        s.idle_split(cold, 999_999, 2, 60_000, 50_000); // just under: warm
+        s.idle_split(cold, 0, 1, 30_000, 20_000);
+        assert_eq!((s.cold, s.cold_us, s.cold_cpu_us), (1, 40_000, 35_000));
+        assert_eq!((s.warm, s.warm_us, s.warm_cpu_us), (3, 90_000, 70_000));
     }
 
     #[test]
@@ -911,10 +957,12 @@ mod tests {
             std::env::set_var("DYN_MOCKER_MM_CORPUS", dir);
             std::env::set_var("DYN_MOCKER_MM_CFG", cfg);
             std::env::set_var("DYN_MOCKER_MM_CLASS", "shot1080");
+            std::env::set_var("DYN_MOCKER_MM_PREWARM", "1");
         }
-        pool::start().expect("pool starts");
-        let (queue, prep, cpu, _idle) = pool::run(vec![0, 5]).await; // two images, the second wraps around the corpus
+        pool::start().expect("pool starts"); // returns after the thread's prewarm
+        let (queue, prep, cpu, idle) = pool::run(vec![0, 5]).await; // two images, the second wraps around the corpus
         assert!(prep > 0 && cpu > 0 && queue < prep, "queue {queue} prep {prep} cpu {cpu}");
+        assert!(idle.is_some(), "a prewarmed thread's first job counts its idle since the prewarm (C33)");
     }
 
     #[tokio::test]
