@@ -28,6 +28,15 @@
 //!                claimed with flock files in `DYN_MOCKER_MM_CMM_LOCKDIR` (/dev/shm) so the prefill workers share the 16.
 //!                Corpus as `rust` (DYN_MOCKER_MM_CORPUS / _CLASS); the tensor is never copied back (the GPU reads it from
 //!                the pool: modelled by the encoder wait)
+//!       vllm     today's deployment (tok_dynamo.md U2): a Dynamo v1.3.1 vLLM worker's image path, in Python, one process per
+//!                worker (RocketKV tok/dyn/vllm_img.py, started here over stdin/stdout): base64 on its asyncio loop, the PIL
+//!                decode in the loop's default executor, then vLLM 0.19's processor cache (by bytes, `_VLLM_CACHE_GIB`, 4)
+//!                and the HF fast processor synchronously on the loop, as AsyncLLM.add_request runs it. EVERY image of the
+//!                request goes there (Dynamo's loader never caches a data URI: a re-sent image is decoded again; only the
+//!                processor is skipped on a hit), so this mode bypasses step 2's LRU. Env: `DYN_MOCKER_MM_PY` (python with
+//!                torch + transformers 4.57.6: mm.sh py's venv), `_VLLM_SCRIPT` (vllm_img.py), `_VLLM_ALLOC` (default: no
+//!                GLIBC_TUNABLES / LD_PRELOAD, as deployed; inherit), corpus / class / cfg as rust
+//!       vllmdraft  the same with PIL's scaled JPEG decode (draft) at the largest 1/k that covers the processor's target
 //!       ideal    nothing (the ceiling)
 //!   4 waits the vision encoder, `DYN_MOCKER_MM_ENC_MS` per miss (A10, modelled; an encode stage ahead of the prefill
 //!     GPU, as Dynamo's E/P/D runs it), in every mode.
@@ -36,7 +45,10 @@
 //! inherit the process's cores (W2-V.1 / V.2).
 //! Telemetry (cumulative, every `DYN_MOCKER_MM_EVERY` requests; nothing per request is logged):
 //!   `mmwork w=<pid> mode= threads= reqs= imgs= miss= queue_us= prep_us= cpu_us= emu_us= enc_us= wait_us= idle_us= starved_us=
-//!    img_us= total_us= cold= cold_us= cold_cpu_us= warm= warm_us= warm_cpu_us= h=<log2 ms buckets>`
+//!    img_us= total_us= cold= cold_us= cold_cpu_us= warm= warm_us= warm_cpu_us= first= evict= py_loop_us= py_dec_us= py_proc_us=
+//!    h=<log2 ms buckets>`
+//! first / evict (M8): images this worker looked up for the first time / misses on images it had looked up before (an eviction);
+//! py_* (vllm only): the Python process's CPU on its loop (base64), in its executor (decode) and in the processor;
 //! where threads = the worker's concurrency for its misses (rust: processor threads; cmm: lanes it owns; emulate: lanes,
 //! 0 = unlimited; ideal: 0) (W2-V.3, M3: equal concurrency, AP4);
 //! where wait = what the request waited for steps 3 + 4, h its histogram (bucket i: wait < 2^i ms, i = 0..15); idle /
@@ -60,6 +72,7 @@ pub enum Mode {
     Rust,
     Emulate,
     Cmm,
+    Vllm,
     Ideal,
 }
 
@@ -76,6 +89,7 @@ pub struct Config {
     every: u64,
     threads: u64,
     cold: Duration,
+    draft: bool,
 }
 
 /// `DYN_MOCKER_MM_CPUS` as a list of cpus (`a,b,c-d`); empty when unset.
@@ -125,8 +139,9 @@ pub fn config() -> Option<&'static Config> {
             Some("rust") => Mode::Rust,
             Some("emulate") => Mode::Emulate,
             Some("cmm") => Mode::Cmm,
+            Some("vllm") | Some("vllmdraft") => Mode::Vllm,
             Some("ideal") => Mode::Ideal,
-            Some(o) => panic!("DYN_MOCKER_MM={o}: rust, emulate, cmm, ideal or off"),
+            Some(o) => panic!("DYN_MOCKER_MM={o}: rust, emulate, cmm, vllm, vllmdraft, ideal or off"),
         };
         let toks: Vec<u32> = std::env::var("DYN_MOCKER_MM_TOKENS")
             .expect("DYN_MOCKER_MM needs DYN_MOCKER_MM_TOKENS=start,pad,end,hex0 (w2.py's meta)")
@@ -154,14 +169,19 @@ pub fn config() -> Option<&'static Config> {
                 Mode::Rust => num("DYN_MOCKER_MM_THREADS", 1).max(1),
                 Mode::Cmm => num("DYN_MOCKER_MM_CMM_LANES", 4),
                 Mode::Emulate => num("DYN_MOCKER_MM_EMU_LANES", 0),
+                Mode::Vllm => 1, // one asyncio loop per worker process runs the processor
                 Mode::Ideal => 0,
             },
+            draft: std::env::var("DYN_MOCKER_MM").ok().as_deref() == Some("vllmdraft"),
         };
         if mode == Mode::Rust {
             pool::start().unwrap_or_else(|e| panic!("DYN_MOCKER_MM=rust: {e}"));
         }
         if mode == Mode::Cmm {
             cmm::start().unwrap_or_else(|e| panic!("DYN_MOCKER_MM=cmm: {e}"));
+        }
+        if mode == Mode::Vllm {
+            vllm::start(c.draft).unwrap_or_else(|e| panic!("DYN_MOCKER_MM=vllm: {e}"));
         }
         tracing::info!(
             mode = ?mode, threads = c.threads, cpus = ?mm_cpus(), emu_ms = c.emu.as_secs_f64() * 1e3, emu_lanes = c.lanes, enc_ms = c.enc.as_secs_f64() * 1e3, cache_n = c.cache_n,
@@ -220,6 +240,11 @@ struct Stats {
     warm: u64,
     warm_us: u64,
     warm_cpu_us: u64,
+    first: u64,
+    evict: u64,
+    py_loop_us: u64,
+    py_dec_us: u64,
+    py_proc_us: u64,
     h: [u64; 16],
 }
 
@@ -240,12 +265,15 @@ impl Stats {
 
 struct Worker {
     cache: VecDeque<u32>,
+    /// every uid this worker has looked up (M8: a miss on a uid seen here before is an eviction; on one never seen here,
+    /// a fresh image or a re-sent one routed from another worker)
+    seen: std::collections::HashSet<u32>,
     st: Stats,
 }
 
 fn worker() -> &'static Mutex<Worker> {
     static W: OnceLock<Mutex<Worker>> = OnceLock::new();
-    W.get_or_init(|| Mutex::new(Worker { cache: VecDeque::new(), st: Stats::default() }))
+    W.get_or_init(|| Mutex::new(Worker { cache: VecDeque::new(), seen: Default::default(), st: Stats::default() }))
 }
 
 fn lanes(n: usize) -> &'static tokio::sync::Semaphore {
@@ -268,7 +296,29 @@ pub async fn before_prefill(c: &Config, tokens: &[u32]) {
     let uids = scan(c, tokens);
     let t0 = Instant::now();
     dynamo_mocker::engine_cpu::starve::img(true);
-    let misses: Vec<u32> = {
+    let mut vllm_misses = None;
+    let mut py = (0u64, 0u64, 0u64);
+    let (mut queue, mut prep, mut cpu, mut emu, mut idle_before) = (0u64, 0u64, 0u64, 0u64, None);
+    // M8: images this worker never looked up before (fresh, or re-sent and routed here from another worker)
+    let first = {
+        let mut w = worker().lock().unwrap();
+        uids.iter().filter(|&&u| w.seen.insert(u)).count() as u64
+    };
+    if c.mode == Mode::Vllm && !uids.is_empty() {
+        // every image goes to the worker's Python process; it reports its own processor-cache hits and misses
+        let t = Instant::now();
+        let r = vllm::run(&uids).await;
+        vllm_misses = Some(r.miss);
+        prep = r.wall_us;
+        queue = (t.elapsed().as_micros() as u64).saturating_sub(r.wall_us); // the pipe both ways
+        cpu = r.cpu_us;
+        py = (r.loop_us, r.dec_us, r.proc_us);
+    }
+    let misses: Vec<u32> = if let Some(m) = vllm_misses {
+        uids[..m as usize].to_vec() // only the count matters below (the encoder wait, the stats)
+    } else if c.mode == Mode::Vllm {
+        Vec::new()
+    } else {
         let mut w = worker().lock().unwrap();
         let mut m = Vec::new();
         for &u in &uids {
@@ -284,7 +334,6 @@ pub async fn before_prefill(c: &Config, tokens: &[u32]) {
         }
         m
     };
-    let (mut queue, mut prep, mut cpu, mut emu, mut idle_before) = (0u64, 0u64, 0u64, 0u64, None);
     if !misses.is_empty() {
         match c.mode {
             Mode::Rust => {
@@ -299,7 +348,7 @@ pub async fn before_prefill(c: &Config, tokens: &[u32]) {
                 let r = cmm::run(misses.clone()).await;
                 (queue, prep, cpu, emu) = (r.0, r.1, r.2, r.3); // emu_us = the service's own time per request (its t_end - t_start)
             }
-            Mode::Ideal => {}
+            Mode::Vllm | Mode::Ideal => {}
         }
         if !c.enc.is_zero() {
             tokio::time::sleep(c.enc * misses.len() as u32).await;
@@ -319,6 +368,11 @@ pub async fn before_prefill(c: &Config, tokens: &[u32]) {
     s.emu_us += emu;
     s.enc_us += enc;
     s.wait_us += wait;
+    s.first += first;
+    s.evict += (misses.len() as u64).saturating_sub(first); // a miss on a uid seen here before: evicted from this worker's cache
+    s.py_loop_us += py.0;
+    s.py_dec_us += py.1;
+    s.py_proc_us += py.2;
     if let Some(idle) = idle_before {
         s.idle_split(c.cold, idle, misses.len() as u64, prep, cpu);
     }
@@ -328,7 +382,7 @@ pub async fn before_prefill(c: &Config, tokens: &[u32]) {
         let h: Vec<String> = s.h.iter().map(|x| x.to_string()).collect();
         let (idle, starved, img, total) = dynamo_mocker::engine_cpu::starve::snapshot();
         tracing::info!(
-            "mmwork w={} mode={:?} threads={} reqs={} imgs={} miss={} queue_us={} prep_us={} cpu_us={} emu_us={} enc_us={} wait_us={} idle_us={} starved_us={} img_us={} total_us={} cold={} cold_us={} cold_cpu_us={} warm={} warm_us={} warm_cpu_us={} h={}",
+            "mmwork w={} mode={:?} threads={} reqs={} imgs={} miss={} queue_us={} prep_us={} cpu_us={} emu_us={} enc_us={} wait_us={} idle_us={} starved_us={} img_us={} total_us={} cold={} cold_us={} cold_cpu_us={} warm={} warm_us={} warm_cpu_us={} first={} evict={} py_loop_us={} py_dec_us={} py_proc_us={} h={}",
             std::process::id(),
             c.mode,
             c.threads,
@@ -351,6 +405,11 @@ pub async fn before_prefill(c: &Config, tokens: &[u32]) {
             s.warm,
             s.warm_us,
             s.warm_cpu_us,
+            s.first,
+            s.evict,
+            s.py_loop_us,
+            s.py_dec_us,
+            s.py_proc_us,
             h.join(",")
         );
     }
@@ -848,6 +907,155 @@ mod cmm {
     }
 }
 
+mod vllm {
+    //! DYN_MOCKER_MM=vllm | vllmdraft: the worker's Python process (RocketKV tok/dyn/vllm_img.py; its docstring holds the
+    //! deployed code path it follows). Lines over its stdin / stdout: `<id> <uid>,...` -> `<id> hits miss wall_us loop_us
+    //! dec_us proc_us cpu_us`; requests are in flight concurrently, as they are in the real worker's loop.
+    use std::collections::HashMap;
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::{ChildStdin, Command, Stdio};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, OnceLock};
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq)]
+    pub struct Reply {
+        pub hits: u64,
+        pub miss: u64,
+        pub wall_us: u64,
+        pub loop_us: u64,
+        pub dec_us: u64,
+        pub proc_us: u64,
+        pub cpu_us: u64,
+    }
+
+    struct Side {
+        stdin: Mutex<ChildStdin>,
+        pending: Mutex<HashMap<u64, tokio::sync::oneshot::Sender<Reply>>>,
+        next: AtomicU64,
+    }
+
+    static SIDE: OnceLock<Side> = OnceLock::new();
+
+    /// `<id> hits miss wall loop dec proc cpu` -> (id, Reply).
+    pub fn parse(line: &str) -> Option<(u64, Reply)> {
+        let v: Vec<u64> = line.split_whitespace().map(|x| x.parse().ok()).collect::<Option<_>>()?;
+        if v.len() != 8 {
+            return None;
+        }
+        Some((v[0], Reply { hits: v[1], miss: v[2], wall_us: v[3], loop_us: v[4], dec_us: v[5], proc_us: v[6], cpu_us: v[7] }))
+    }
+
+    pub fn start(draft: bool) -> Result<(), String> {
+        let env = |k: &str| std::env::var(k).map_err(|_| format!("{k} is not set"));
+        let py = std::env::var("DYN_MOCKER_MM_PY").unwrap_or_else(|_| "python3".into());
+        let script = env("DYN_MOCKER_MM_VLLM_SCRIPT")?;
+        let mut cmd = Command::new(&py);
+        cmd.arg(&script)
+            .args(["--corpus", &env("DYN_MOCKER_MM_CORPUS")?])
+            .args(["--class", &std::env::var("DYN_MOCKER_MM_CLASS").unwrap_or_else(|_| "agent720".into())])
+            .args(["--cfg", &env("DYN_MOCKER_MM_CFG")?])
+            .args(["--cache-gib", &std::env::var("DYN_MOCKER_MM_VLLM_CACHE_GIB").unwrap_or_else(|_| "4".into())])
+            .args(["--cpus", &std::env::var("DYN_MOCKER_MM_CPUS").unwrap_or_default()])
+            .args(["--prewarm", &std::env::var("DYN_MOCKER_MM_PREWARM").unwrap_or_else(|_| "2".into())])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
+        if draft {
+            cmd.arg("--draft");
+        }
+        // as deployed (Q63): the vLLM worker runs on the default allocator, without the mocker's TUN or a preloaded malloc
+        if std::env::var("DYN_MOCKER_MM_VLLM_ALLOC").as_deref().unwrap_or("default") == "default" {
+            cmd.env_remove("GLIBC_TUNABLES").env_remove("LD_PRELOAD");
+        }
+        #[cfg(target_os = "linux")]
+        unsafe {
+            use std::os::unix::process::CommandExt;
+            cmd.pre_exec(|| {
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM); // it dies with the worker
+                Ok(())
+            });
+        }
+        let mut child = cmd.spawn().map_err(|e| format!("{py} {script}: {e}"))?;
+        let stdin = child.stdin.take().expect("piped");
+        let mut out = BufReader::new(child.stdout.take().expect("piped"));
+        let mut first = String::new();
+        out.read_line(&mut first).map_err(|e| format!("vllm_img.py: {e}"))?;
+        let info = first.strip_prefix("ready ").ok_or(format!("vllm_img.py did not start: {first:?} (its stderr is in this log)"))?;
+        tracing::info!("mocker images: vLLM image process ready {}", info.trim());
+        SIDE.set(Side { stdin: Mutex::new(stdin), pending: Mutex::new(HashMap::new()), next: AtomicU64::new(0) })
+            .map_err(|_| "vllm image process started twice".to_string())?;
+        std::thread::Builder::new()
+            .name("mm-vllm-rx".into())
+            .spawn(move || {
+                let side = SIDE.get().expect("set above");
+                for line in out.lines() {
+                    let line = line.expect("vllm_img.py stdout");
+                    let (id, r) = parse(&line).unwrap_or_else(|| panic!("vllm_img.py: bad reply {line:?}"));
+                    if let Some(tx) = side.pending.lock().unwrap().remove(&id) {
+                        let _ = tx.send(r);
+                    }
+                }
+                panic!("vllm_img.py exited (its stderr is in this log)");
+            })
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub async fn run(uids: &[u32]) -> Reply {
+        let side = SIDE.get().expect("vllm image process started");
+        let id = side.next.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        side.pending.lock().unwrap().insert(id, tx);
+        let list: Vec<String> = uids.iter().map(|u| u.to_string()).collect();
+        {
+            let mut w = side.stdin.lock().unwrap();
+            writeln!(w, "{id} {}", list.join(",")).expect("vllm_img.py stdin");
+            w.flush().expect("vllm_img.py stdin");
+        }
+        rx.await.expect("vllm_img.py answers")
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn parses_replies() {
+            assert_eq!(
+                parse("7 1 2 150000 900 80000 95000 175900"),
+                Some((7, Reply { hits: 1, miss: 2, wall_us: 150000, loop_us: 900, dec_us: 80000, proc_us: 95000, cpu_us: 175900 }))
+            );
+            assert_eq!(parse("ready {}"), None);
+            assert_eq!(parse("7 1 2"), None);
+        }
+
+        /// The real Python process: RK_MM_PY=<python with torch + transformers 4.57.6> RK_VLLM_SCRIPT=<RocketKV>/tok/dyn/vllm_img.py
+        /// RK_MM_CORPUS=<RocketKV>/tok/mm/corpus RK_MM_CFG=<RocketKV>/tok/mm/cfg/qwen3-vl-cap1280-bicubic.json; skipped without them.
+        #[tokio::test]
+        async fn roundtrip_against_vllm_img() {
+            let (Ok(py), Ok(script), Ok(dir), Ok(cfg)) =
+                (std::env::var("RK_MM_PY"), std::env::var("RK_VLLM_SCRIPT"), std::env::var("RK_MM_CORPUS"), std::env::var("RK_MM_CFG"))
+            else {
+                eprintln!("skipped: set RK_MM_PY, RK_VLLM_SCRIPT, RK_MM_CORPUS and RK_MM_CFG");
+                return;
+            };
+            unsafe {
+                std::env::set_var("DYN_MOCKER_MM_PY", py);
+                std::env::set_var("DYN_MOCKER_MM_VLLM_SCRIPT", script);
+                std::env::set_var("DYN_MOCKER_MM_CORPUS", dir);
+                std::env::set_var("DYN_MOCKER_MM_CFG", cfg);
+                std::env::set_var("DYN_MOCKER_MM_CLASS", "shot1080");
+                std::env::set_var("DYN_MOCKER_MM_PREWARM", "1");
+            }
+            start(false).expect("vllm_img.py starts and says ready");
+            let a = run(&[5, 6]).await; // two fresh images: two processor misses
+            let b = run(&[6, 7]).await; // 6 again: the processor is skipped, the decode is not (a data URI is never cached)
+            assert_eq!((a.hits, a.miss, b.hits, b.miss), (0, 2, 1, 1), "{a:?} {b:?}");
+            assert!(a.proc_us > 0 && b.dec_us > 0 && a.wall_us > 0, "{a:?} {b:?}");
+        }
+    }
+}
+
 #[cfg(not(feature = "mm-routing"))]
 mod cmm {
     pub fn start() -> Result<(), String> {
@@ -863,7 +1071,7 @@ mod pool {
     pub fn start() -> Result<(), String> {
         Err("this build has no llm-multimodal: build the bindings with --features mm-routing (tok/dyn/build.sh dynamo)".into())
     }
-    pub async fn run(_uids: Vec<u32>) -> (u64, u64, u64, u64) {
+    pub async fn run(_uids: Vec<u32>) -> (u64, u64, u64, Option<u64>) {
         unreachable!("start() refused")
     }
 }
@@ -886,6 +1094,7 @@ mod tests {
             every: 1,
             threads: 0,
             cold: Duration::from_millis(1000),
+            draft: false,
         }
     }
 
@@ -986,5 +1195,6 @@ mod tests {
         before_prefill(&c, &block(2, 12)).await; // miss again
         let w = worker().lock().unwrap();
         assert_eq!((w.st.reqs, w.st.imgs, w.st.miss), (4, 5, 4));
+        assert_eq!((w.st.first, w.st.evict), (3, 1), "uid 2's second miss is an eviction (M8)");
     }
 }
