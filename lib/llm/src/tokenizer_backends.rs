@@ -198,9 +198,16 @@ impl CachedTokenizerV2 {
         cache_bytes: u64,
         on_hit: CacheEventFn,
         on_miss: CacheEventFn,
-    ) -> Self {
-        let cache = PrefixCacheV2::new(policy_source, cache_bytes);
+    ) -> Result<Self> {
+        // DYN_TOKENIZER_CACHE_SHM=<file>: one cache in shared memory for every frontend on this host (tokenizer_shm_index.rs); a failure stops the frontend, no silent private fallback
+        let shm = std::env::var("DYN_TOKENIZER_CACHE_SHM").ok().filter(|p| !p.is_empty());
+        let cache = match &shm {
+            Some(path) => PrefixCacheV2::shared(policy_source, cache_bytes, path)
+                .with_context(|| format!("DYN_TOKENIZER_CACHE_SHM={path}"))?,
+            None => PrefixCacheV2::new(policy_source, cache_bytes),
+        };
         match cache.disabled_reason() {
+            None if shm.is_some() => tracing::info!(cache_bytes, "token cache policy v2 (shm): prefix reuse on, shared by every frontend of the file"),
             None => tracing::info!(cache_bytes, "token cache policy v2 (host): prefix reuse on"),
             Some(reason) => tracing::warn!(
                 cache_bytes,
@@ -208,7 +215,7 @@ impl CachedTokenizerV2 {
                 "token cache policy v2 (host): prefix reuse disabled, every request is a full encode"
             ),
         }
-        Self {
+        Ok(Self {
             inner,
             cache,
             on_hit,
@@ -218,7 +225,7 @@ impl CachedTokenizerV2 {
                 &["hits", "misses", "reused_tokens", "encoded_tokens", "encoded_bytes"],
                 &["entries", "cache_bytes", "evictions", "drops"],   // T7, Moka's counts without a sync
             ),
-        }
+        })
     }
 }
 

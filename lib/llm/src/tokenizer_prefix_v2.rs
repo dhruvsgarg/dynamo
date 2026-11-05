@@ -25,6 +25,7 @@ use std::sync::{
 use moka::{notification::RemovalCause, sync::Cache};
 
 use crate::tokenizer_cache_policy::PrefixCachePolicy;
+use crate::tokenizer_shm_index::ShmIndex;
 
 /// What one request did in the cache.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -66,10 +67,31 @@ struct Entry {
     restart: usize,
 }
 
+/// A hit's cached IDs: an owned reference (private), or read in place in the mapping (shared).
+enum Ids<'a> {
+    Owned(Arc<[u32]>),
+    InPlace(&'a [u32]),
+}
+
+impl Ids<'_> {
+    fn as_slice(&self) -> &[u32] {
+        match self {
+            Ids::Owned(ids) => ids,
+            Ids::InPlace(ids) => ids,
+        }
+    }
+}
+
+/// Where entries live: this process's DRAM (Moka), or one mapping every frontend shares (`DYN_TOKENIZER_CACHE_SHM`).
+enum Index {
+    Private(Cache<Arc<str>, Entry>),
+    Shared(ShmIndex),
+}
+
 pub struct PrefixCacheV2 {
     policy: Option<PrefixCachePolicy>,
     disabled: Option<String>,
-    index: Cache<Arc<str>, Entry>,
+    index: Index,
     capacity: u64,
     hits: AtomicU64,
     misses: AtomicU64,
@@ -84,10 +106,6 @@ impl PrefixCacheV2 {
     /// `tokenizer` is the exact instance the segments are encoded with (after Dynamo's
     /// `tokenizer_config.json` special-token merge). `capacity` = key bytes + ID bytes.
     pub fn new(tokenizer: &tokenizers::Tokenizer, capacity: u64) -> Self {
-        let (policy, disabled) = match PrefixCachePolicy::new(tokenizer) {
-            Ok(policy) => (Some(policy), None),
-            Err(reason) => (None, Some(reason)),
-        };
         let evictions = Arc::new(AtomicU64::new(0));
         let count = evictions.clone();
         let index = Cache::builder()
@@ -101,6 +119,23 @@ impl PrefixCacheV2 {
                 }
             })
             .build();
+        Self::with_index(tokenizer, Index::Private(index), capacity, evictions)
+    }
+
+    /// One cache in `path`, shared by every process that opens it with the same tokenizer and budget (no eviction: tokenizer_shm_index.rs).
+    pub fn shared(tokenizer: &tokenizers::Tokenizer, capacity: u64, path: &str) -> std::io::Result<Self> {
+        let json = tokenizer.to_string(false).map_err(|e| std::io::Error::other(e.to_string()))?;
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&json, &mut h);
+        let index = ShmIndex::open(path, capacity, std::hash::Hasher::finish(&h))?;
+        Ok(Self::with_index(tokenizer, Index::Shared(index), capacity, Arc::new(AtomicU64::new(0))))
+    }
+
+    fn with_index(tokenizer: &tokenizers::Tokenizer, index: Index, capacity: u64, evictions: Arc<AtomicU64>) -> Self {
+        let (policy, disabled) = match PrefixCachePolicy::new(tokenizer) {
+            Ok(policy) => (Some(policy), None),
+            Err(reason) => (None, Some(reason)),
+        };
         Self {
             policy,
             disabled,
@@ -140,21 +175,26 @@ impl PrefixCacheV2 {
         };
         let mut found = None;
         for end in policy.candidates(text).into_iter().rev() {
-            // Arc<str> equality checks every prefix byte: a hash collision cannot reuse IDs.
-            if let Some(entry) = self.index.get(&text[..end]) {
+            // Both indexes compare every prefix byte: a hash collision cannot reuse IDs.
+            let entry = match &self.index {
+                Index::Private(index) => index.get(&text[..end]).map(|e| (Ids::Owned(e.ids), e.restart)),
+                Index::Shared(index) => index.get(&text[..end]).map(|(ids, restart)| (Ids::InPlace(ids), restart)),
+            };
+            if let Some((ids, restart)) = entry {
                 // Appended bytes can make a longer added token win over this cut: confirm it
                 // with the library's matcher from the key's restart point (and learn the cuts after it).
-                let scan = policy.scan(text, entry.restart);
+                let scan = policy.scan(text, restart);
                 if scan.cuts.contains(&end) {
-                    found = Some((end, entry.ids, scan));
+                    found = Some((end, ids, scan));
                     break;
                 }
             }
         }
         let (ids, outcome) = if let Some((prefix, cached, scan)) = found {
             let deepest = *scan.cuts.last().expect("the prefix is a cut");
+            let cached = cached.as_slice();
             let mut ids = Vec::with_capacity(cached.len() + (text.len() - prefix) / 2 + 16);
-            ids.extend_from_slice(&cached);
+            ids.extend_from_slice(cached);
             if deepest > prefix {
                 ids.extend(segment(&text[prefix..deepest])?);
                 self.insert(&text[..deepest], &ids, policy.restart(text, &scan, deepest));
@@ -202,26 +242,40 @@ impl PrefixCacheV2 {
             self.drops.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        self.index.insert(Arc::from(key), Entry { ids: Arc::from(ids), restart });
+        match &self.index {
+            Index::Private(index) => index.insert(Arc::from(key), Entry { ids: Arc::from(ids), restart }),
+            Index::Shared(index) => {
+                index.insert(key, ids, restart); // its own drop count: stats()
+            }
+        }
     }
 
     /// Cumulative counters. `sync` runs Moka's pending maintenance first (exact entries/bytes);
     /// never call it on the request path.
     pub fn stats(&self, sync: bool) -> Stats {
-        if sync {
-            self.index.run_pending_tasks();
-        }
+        let (entries, weighted_bytes, shared_drops) = match &self.index {
+            Index::Private(index) => {
+                if sync {
+                    index.run_pending_tasks();
+                }
+                (index.entry_count(), index.weighted_size(), 0)
+            }
+            Index::Shared(index) => {
+                let s = index.stats();
+                (s.entries, s.used_bytes, s.drops)
+            }
+        };
         Stats {
             hits: self.hits.load(Ordering::Relaxed),
             misses: self.misses.load(Ordering::Relaxed),
             bypassed: self.bypassed.load(Ordering::Relaxed),
             reused_tokens: self.reused.load(Ordering::Relaxed),
             encoded_tokens: self.encoded.load(Ordering::Relaxed),
-            entries: self.index.entry_count(),
-            weighted_bytes: self.index.weighted_size(),
+            entries,
+            weighted_bytes,
             capacity_bytes: self.capacity,
             evictions: self.evictions.load(Ordering::Relaxed),
-            admission_drops: self.drops.load(Ordering::Relaxed),
+            admission_drops: self.drops.load(Ordering::Relaxed) + shared_drops,
         }
     }
 }
@@ -278,6 +332,42 @@ mod tests {
         let s = c.stats(true);
         assert_eq!((s.hits, s.misses, s.bypassed), (3, 1, 0));
         assert!(s.weighted_bytes <= 4096 && s.entries >= 2);
+    }
+
+    /// Two caches on one file act as one: a prompt encoded through one hits through the other, and every encode equals the full encode.
+    #[test]
+    fn shared_cache_hits_across_instances_with_parity() {
+        let t = tokenizer();
+        let p = format!("/dev/shm/rktok-v2-{}", std::process::id());
+        let _ = std::fs::remove_file(&p);
+        let (a, b) = (PrefixCacheV2::shared(&t, 1 << 20, &p).unwrap(), PrefixCacheV2::shared(&t, 1 << 20, &p).unwrap());
+        let turns = ["shared <s>private one", "shared <s>private one <s>two", "shared <s>private one <s>two <s>one", "shared <s>two"];
+        for (i, text) in turns.iter().enumerate() {
+            let c = if i % 2 == 0 { &a } else { &b };
+            let (ids, out) = c.encode(text, |s| full(&t, s)).unwrap();
+            assert_eq!(ids, full(&t, text).unwrap(), "{text}");
+            assert_eq!(out.lookup, if i == 0 { Lookup::Miss } else { Lookup::Hit }, "{text}");
+            if i > 0 {
+                assert!(out.reused_tokens > 0, "{text}");
+            }
+        }
+        // the private cache on the same turns: no sharing between two instances
+        let (x, y) = (PrefixCacheV2::new(&t, 4096), PrefixCacheV2::new(&t, 4096));
+        x.encode(turns[0], |s| full(&t, s)).unwrap();
+        assert_eq!(y.encode(turns[1], |s| full(&t, s)).unwrap().1.lookup, Lookup::Miss);
+        std::fs::remove_file(&p).unwrap();
+    }
+
+    #[test]
+    fn shared_cache_refuses_another_tokenizer() {
+        let t = tokenizer();
+        let mut other = tokenizer();
+        other.add_special_tokens(&[tokenizers::AddedToken::from("<z>", true)]);
+        let p = format!("/dev/shm/rktok-guard-{}", std::process::id());
+        let _ = std::fs::remove_file(&p);
+        let _a = PrefixCacheV2::shared(&t, 1 << 16, &p).unwrap();
+        assert!(PrefixCacheV2::shared(&other, 1 << 16, &p).is_err());
+        std::fs::remove_file(&p).unwrap();
     }
 
     #[test]

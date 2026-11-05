@@ -41,6 +41,7 @@ pub use dynamo_tokenizers as tokenizers;
 pub mod tokenizer_backends;
 pub mod tokenizer_cache_policy;
 pub mod tokenizer_prefix_v2;
+pub mod tokenizer_shm_index;
 pub use dynamo_tokenizers::{file_json_field, log_json_err};
 pub mod tokens;
 pub mod types;

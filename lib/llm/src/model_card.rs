@@ -1207,7 +1207,7 @@ impl ModelDeploymentCard {
                             cache_bytes as u64,
                             on_hit,
                             on_miss,
-                        ))
+                        )?)
                     }
                     EncoderKind::Host if cache_enabled => {
                         tracing::info!(
