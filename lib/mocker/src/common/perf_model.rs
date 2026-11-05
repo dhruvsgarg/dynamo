@@ -130,6 +130,25 @@ impl std::fmt::Debug for PerfModel {
     }
 }
 
+/// A hit is not free on a real GPU: its cost grows with the context found, and the curves here charge new tokens only.
+/// `DYN_MOCKER_HIT_A_MS` + `DYN_MOCKER_HIT_B_MS_PER_KTOK` x cached k tokens + `DYN_MOCKER_HIT_C_MS` x new k tokens x cached M tokens (new tokens attending
+/// to the cached context), fit by RocketKV `wlsim.py` on a real engine's turns. Unset: 0, the stock behaviour.
+fn hit_params() -> (f64, f64, f64) {
+    static P: std::sync::OnceLock<(f64, f64, f64)> = std::sync::OnceLock::new();
+    *P.get_or_init(|| {
+        let v = |k: &str| std::env::var(k).ok().and_then(|x| x.parse().ok()).unwrap_or(0.0);
+        (v("DYN_MOCKER_HIT_A_MS"), v("DYN_MOCKER_HIT_B_MS_PER_KTOK"), v("DYN_MOCKER_HIT_C_MS"))
+    })
+}
+
+fn hit_cost_ms(prefix: usize, new_tokens: usize) -> f64 {
+    if prefix == 0 {
+        return 0.0;
+    }
+    let (a, b, c) = hit_params();
+    a + b * prefix as f64 / 1000.0 + c * new_tokens as f64 / 1000.0 * prefix as f64 / 1e6
+}
+
 impl PerfModel {
     /// Load performance model from NPZ file
     ///
@@ -263,8 +282,12 @@ impl PerfModel {
     /// - Aiconfigurator: passes (batch_size, isl - prefix, prefix) to the AIC SDK
     pub fn predict_prefill_time(&self, batch_size: usize, isl: usize, prefix: usize) -> f64 {
         let new_tokens_per_req = isl.saturating_sub(prefix);
-        if batch_size == 0 || new_tokens_per_req == 0 {
+        if batch_size == 0 {
             return 0.0;
+        }
+        let hit = hit_cost_ms(prefix, new_tokens_per_req);
+        if new_tokens_per_req == 0 {
+            return hit;
         }
         let time = match self {
             PerfModel::Polynomial => {
@@ -285,7 +308,7 @@ impl PerfModel {
                 prefix,
             ),
         };
-        time.max(0.0)
+        time.max(0.0) + hit
     }
 
     /// Predict decode time in milliseconds.
