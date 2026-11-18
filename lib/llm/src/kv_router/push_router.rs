@@ -477,6 +477,9 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
             .map(|tracker| tracker.phase())
             .unwrap_or(RequestPhase::Aggregated);
         let phase_label = phase.to_string();
+        // RocketKV T2: route = select + track; forward = dispatch (serialize + send)
+        let t2_rid = crate::t2::enabled().then(|| request.context().id().to_string());
+        let t2_route_start = std::time::Instant::now();
         let route_guard = StageGuard::new(STAGE_ROUTE, &phase_label);
         let (mut selection, mut operation) = self
             .select_with_affinity(&request, phase, is_query_only)
@@ -536,13 +539,22 @@ impl AsyncEngine<SingleIn<PreprocessedRequest>, ManyOut<Annotated<LLMEngineOutpu
             }
         };
         drop(route_guard);
+        let t2_forward_start = std::time::Instant::now();
+        if let Some(rid) = &t2_rid {
+            let ms = (t2_forward_start - t2_route_start).as_secs_f64() * 1e3;
+            crate::t2::add(rid, crate::t2::Part::Route, ms);
+        }
         let selected_target = AffinityTarget {
             worker_id: selection.instance_id,
             dp_rank: Some(selection.dp_rank),
         };
-        let stream = match self
+        let dispatched = self
             .dispatch_selection(request, selection, guard, operation.is_some())
-            .await
+            .await;
+        if let Some(rid) = &t2_rid {
+            crate::t2::add_since(rid, crate::t2::Part::Forward, t2_forward_start);
+        }
+        let stream = match dispatched
         {
             Ok(stream) => stream,
             Err(error) => {

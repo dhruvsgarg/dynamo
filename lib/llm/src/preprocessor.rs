@@ -251,6 +251,9 @@ pub struct OpenAIPreprocessor {
     kv_cache_block_size: usize,
     tool_call_parser: Option<String>,
     media_loader: Option<MediaLoader>,
+    /// RocketKV B1: `DYN_MM_SEND_TWICE=1` keeps inline `data:` URLs in
+    /// `extra_args.messages` (old fork behaviour; read once at construction).
+    mm_send_twice: bool,
     /// Max context length (in tokens) this model can handle, from ModelDeploymentCard
     context_length: u32,
     /// Per-image token-count engine. `None` when the feature is disabled, the
@@ -775,6 +778,7 @@ impl OpenAIPreprocessor {
             kv_cache_block_size,
             tool_call_parser,
             media_loader,
+            mm_send_twice: std::env::var("DYN_MM_SEND_TWICE").is_ok_and(|v| v == "1"),
             context_length,
             #[cfg(feature = "mm-routing")]
             image_token_counter,
@@ -840,6 +844,7 @@ impl OpenAIPreprocessor {
                 .with_context(|| "Failed to apply prompt template")?
         };
         TEMPLATE_SECONDS.observe(template_start.elapsed().as_secs_f64());
+        crate::t2::add_current(crate::t2::Part::Template, template_start);
 
         // Generic reasoning parsers start from `<think>`; MiniMax M3 starts
         // from `<mm:think>`. If the chat template injected that opener at the
@@ -856,7 +861,9 @@ impl OpenAIPreprocessor {
                 .with_context(|| "Failed to gather tokens")?
         };
         TOKENIZE_SECONDS.observe(tokenize_start.elapsed().as_secs_f64());
+        crate::t2::add_current(crate::t2::Part::Tokenize, tokenize_start);
 
+        let mm_start = Instant::now();
         let _mm_image_entries = self
             .gather_multi_modal_data(
                 request,
@@ -866,13 +873,18 @@ impl OpenAIPreprocessor {
             )
             .await
             .with_context(|| "Failed to gather multimodal data")?;
+        crate::t2::add_current(crate::t2::Part::Mm, mm_start);
 
         // Build the MM-aware view (expanded routing_token_ids + per-block
         // mm_hashes) for the KV router. No-op when no images are present or
         // the model has no resolved image-placeholder.
         #[cfg(feature = "mm-routing")]
-        self.gather_mm_exact_routing_info(&mut builder, &_mm_image_entries, &token_ids)
-            .with_context(|| "Failed to build MM routing info")?;
+        {
+            let mm_route_start = Instant::now();
+            self.gather_mm_exact_routing_info(&mut builder, &_mm_image_entries, &token_ids)
+                .with_context(|| "Failed to build MM routing info")?;
+            crate::t2::add_current(crate::t2::Part::MmRoute, mm_route_start);
+        }
 
         // Install tokens on the builder. Done after MM routing built its
         // view so the routing-side borrow stays cheap and builder ownership
@@ -1194,6 +1206,12 @@ impl OpenAIPreprocessor {
         }
     }
 
+    /// RocketKV B1: strip `data:` URLs from `extra_args.messages`? Always with frontend
+    /// decoding (upstream); otherwise unless `DYN_MM_SEND_TWICE=1`.
+    fn strip_data_urls_decision(has_media_loader: bool, send_twice: bool) -> bool {
+        has_media_loader || !send_twice
+    }
+
     /// Replace inline `data:` URLs with empty strings in message content parts.
     /// Preserves HTTP(S) URLs, text content, and overall message structure.
     fn strip_inline_data_urls(messages: &mut serde_json::Value) {
@@ -1268,6 +1286,8 @@ impl OpenAIPreprocessor {
             return Ok(Vec::new());
         };
         let has_media_loader = self.media_loader.is_some();
+        // RocketKV T2 / B1: bytes of inline data: URLs that go to the worker in multi_modal_data
+        let mut t2_data_url_bytes: usize = 0;
 
         for message in messages.iter() {
             let content_parts = match message {
@@ -1303,6 +1323,9 @@ impl OpenAIPreprocessor {
                         }
                         _ => continue,
                     };
+                    if url.as_str().starts_with("data:") {
+                        t2_data_url_bytes += url.as_str().len();
+                    }
                     #[cfg(feature = "mm-routing")]
                     if type_str == "image_url" {
                         total_image_count += 1;
@@ -1455,11 +1478,17 @@ impl OpenAIPreprocessor {
                 "messages": messages_json
             });
 
-            // Strip redundant inline data: URLs only when frontend decoding is active
-            // (media_loader decoded the images into RDMA descriptors). TRT-LLM and
-            // other backends that pass URLs through still need the original data: URIs.
-            if self.media_loader.is_some() {
+            // Strip redundant inline data: URLs from the messages copy. Upstream strips
+            // only with frontend decoding; RocketKV B1 (sc_demo.md) emulates Dynamo
+            // v1.6.0 #14801 ("inline data: media not sent twice"): the images already
+            // ride in `multi_modal_data`, and the vLLM worker never reads
+            // `extra_args.messages`. `DYN_MM_SEND_TWICE=1` = the old behaviour
+            // (TRT-LLM and other URL-passthrough backends still need the data: URIs).
+            if Self::strip_data_urls_decision(self.media_loader.is_some(), self.mm_send_twice) {
                 Self::strip_inline_data_urls(&mut extra_args["messages"]);
+                crate::t2::set_bytes_current(t2_data_url_bytes, 0);
+            } else {
+                crate::t2::set_bytes_current(t2_data_url_bytes, t2_data_url_bytes);
             }
 
             if let Some(prompt) = formatted_prompt {
@@ -3255,9 +3284,15 @@ impl
         };
 
         // convert the chat completion request to a common completion request
-        let (mut common_request, annotations, prompt_injected_reasoning) = self
-            .preprocess_request_with_options(&request, tracker.as_deref(), preprocess_options)
-            .await?;
+        // (RocketKV T2: under the request id, so the inner steps can record their times)
+        let preprocess =
+            self.preprocess_request_with_options(&request, tracker.as_deref(), preprocess_options);
+        let (mut common_request, annotations, prompt_injected_reasoning) =
+            if crate::t2::enabled() {
+                crate::t2::RID.scope(request_id.clone(), preprocess).await?
+            } else {
+                preprocess.await?
+            };
         attach_agent_context_from_context(&mut common_request, &context);
 
         let uses_tool_call_structural_tag = self.apply_tool_choice_guided_decoding(
@@ -4838,5 +4873,170 @@ mod tests {
             s3a, s3b,
             "s3:// query params identify objects and must not collide"
         );
+    }
+}
+
+/// RocketKV B1 (sc_demo.md): inline `data:` images sent once to the worker.
+#[cfg(test)]
+mod b1_tests {
+    use super::*;
+    use crate::model_card::ModelDeploymentCard;
+
+    // 1x1 PNG
+    const PNG: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+    const MODEL_PATH: &str = "tests/data/sample-models/mock-llama-3.1-8b-instruct";
+    #[cfg(feature = "mm-routing")]
+    const IMG_TOK: crate::protocols::TokenIdType = 128_011;
+
+    fn preprocessor(send_twice: bool) -> OpenAIPreprocessor {
+        let mdc = ModelDeploymentCard::load_from_disk(MODEL_PATH, None).unwrap();
+        let p = OpenAIPreprocessor::new(mdc).unwrap();
+        let mut p = Arc::try_unwrap(p).ok().unwrap();
+        assert!(p.media_loader.is_none(), "B1 is the URL-passthrough path");
+        p.mm_send_twice = send_twice;
+        #[cfg(feature = "mm-routing")]
+        {
+            p.routing_image_token_id = Some(IMG_TOK);
+        }
+        p
+    }
+
+    fn request() -> NvCreateChatCompletionRequest {
+        serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "what is on screen?"},
+                    {"type": "image_url", "image_url": {"url": PNG}},
+                    {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}
+                ]},
+                {"role": "assistant", "content": "a button"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "and now?"},
+                    {"type": "image_url", "image_url": {"url": PNG}}
+                ]}
+            ]
+        }))
+        .unwrap()
+    }
+
+    async fn gather(send_twice: bool) -> PreprocessedRequest {
+        let p = preprocessor(send_twice);
+        let req = request();
+        let mut builder = p.builder(&req).unwrap();
+        #[cfg(feature = "mm-routing")]
+        let token_ids: Vec<crate::protocols::TokenIdType> = vec![1, IMG_TOK, 2, IMG_TOK, 3];
+        #[cfg(not(feature = "mm-routing"))]
+        let token_ids: Vec<crate::protocols::TokenIdType> = vec![1, 2, 3];
+        p.gather_multi_modal_data(&req, &mut builder, Some("prompt"), &token_ids)
+            .await
+            .unwrap();
+        builder.token_ids(token_ids);
+        builder.build().unwrap()
+    }
+
+    fn urls_in_messages(pre: &PreprocessedRequest) -> Vec<String> {
+        let msgs = &pre.extra_args.as_ref().unwrap()["messages"];
+        let mut out = Vec::new();
+        for m in msgs.as_array().unwrap() {
+            if let Some(parts) = m["content"].as_array() {
+                for part in parts {
+                    if let Some(u) = part["image_url"]["url"].as_str() {
+                        out.push(u.to_string());
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn urls_in_mm_data(pre: &PreprocessedRequest) -> Vec<String> {
+        pre.multi_modal_data.as_ref().unwrap()["image_url"]
+            .iter()
+            .map(|d| match d {
+                MultimodalData::Url(u) => u.as_str().to_string(),
+                other => panic!("expected a URL, got {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn b1_strip_decision() {
+        // frontend decoding always strips (upstream); otherwise unless DYN_MM_SEND_TWICE=1
+        assert!(OpenAIPreprocessor::strip_data_urls_decision(true, false));
+        assert!(OpenAIPreprocessor::strip_data_urls_decision(true, true));
+        assert!(OpenAIPreprocessor::strip_data_urls_decision(false, false));
+        assert!(!OpenAIPreprocessor::strip_data_urls_decision(false, true));
+    }
+
+    #[tokio::test]
+    async fn b1_data_urls_sent_once_by_default() {
+        let once = gather(false).await;
+        let twice = gather(true).await;
+
+        // the worker still gets every image, data URL intact, in multi_modal_data
+        let mm = urls_in_mm_data(&once);
+        assert_eq!(mm, vec![PNG, "https://example.com/a.png", PNG]);
+        assert_eq!(mm, urls_in_mm_data(&twice));
+
+        // the messages copy: data URLs emptied, http(s) kept, structure and text kept
+        assert_eq!(urls_in_messages(&once), vec!["", "https://example.com/a.png", ""]);
+        assert_eq!(urls_in_messages(&twice), vec![PNG, "https://example.com/a.png", PNG]);
+        let (a, b) = (
+            &once.extra_args.as_ref().unwrap()["messages"],
+            &twice.extra_args.as_ref().unwrap()["messages"],
+        );
+        assert_eq!(a.as_array().unwrap().len(), 3);
+        assert_eq!(a[0]["content"][0], b[0]["content"][0]);
+        assert_eq!(a[1], b[1]);
+        assert_eq!(
+            once.extra_args.as_ref().unwrap()["formatted_prompt"],
+            "prompt"
+        );
+
+        // routing keys do not depend on the messages copy
+        let ea = once.extra_args.as_ref().unwrap();
+        let eb = twice.extra_args.as_ref().unwrap();
+        assert_eq!(ea.get("mm_hashes"), eb.get("mm_hashes"));
+        #[cfg(feature = "mm-routing")]
+        {
+            // 2 data-URL images resolve dims; the https one has no server here, so its dims
+            // fail and mm_hashes is skipped for the whole request in both modes
+            assert!(ea.get("mm_hashes").is_none());
+        }
+
+        // bytes: the default request is smaller by the data URLs' size
+        let size = |p: &PreprocessedRequest| serde_json::to_vec(p).unwrap().len();
+        assert!(size(&twice) - size(&once) >= 2 * PNG.len());
+    }
+
+    #[cfg(feature = "mm-routing")]
+    #[tokio::test]
+    async fn b1_mm_hashes_unchanged() {
+        // data URLs only: dims resolve locally, mm_hashes forwarded, same in both modes
+        let run = |send_twice: bool| async move {
+            let p = preprocessor(send_twice);
+            let mut req = request();
+            req.inner.messages.retain(|m| {
+                !serde_json::to_string(m).unwrap().contains("example.com")
+            });
+            let mut builder = p.builder(&req).unwrap();
+            let token_ids = vec![1, IMG_TOK, 2];
+            p.gather_multi_modal_data(&req, &mut builder, None, &token_ids)
+                .await
+                .unwrap();
+            builder.token_ids(token_ids);
+            builder.build().unwrap()
+        };
+        let (once, twice) = (run(false).await, run(true).await);
+        let h = once.extra_args.as_ref().unwrap()["mm_hashes"].clone();
+        assert_eq!(
+            h,
+            serde_json::json!([format!("{:016x}", OpenAIPreprocessor::hash_image_url(PNG))])
+        );
+        assert_eq!(h, twice.extra_args.as_ref().unwrap()["mm_hashes"]);
+        assert_eq!(urls_in_messages(&once), vec![""]);
+        assert_eq!(urls_in_messages(&twice), vec![PNG]);
+        assert_eq!(urls_in_mm_data(&once), vec![PNG]);
     }
 }

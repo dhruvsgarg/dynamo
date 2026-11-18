@@ -463,6 +463,19 @@ impl From<HttpError> for ErrorMessage {
 // Problem: Currently we are using JSON from axum as the request validator. Whenever there is an invalid JSON, it will return a 422.
 // But all the downstream apps that relies on openai based APIs, expects to get 400 for all these cases otherwise they fail badly
 // Solution: Intercept the response from handlers and convert ANY 422 status codes to 400 with the actual error message.
+/// RocketKV T2: handler-entry time, set before axum reads the body (`DYN_T2=1` only).
+#[derive(Clone, Copy)]
+pub struct T2Start(pub std::time::Instant, pub f64);
+
+pub async fn t2_start_middleware(mut request: Request<Body>, next: Next) -> Response {
+    if crate::t2::enabled() {
+        request
+            .extensions_mut()
+            .insert(T2Start(std::time::Instant::now(), crate::t2::unix_ms()));
+    }
+    next.run(request).await
+}
+
 pub async fn smart_json_error_middleware(request: Request<Body>, next: Next) -> Response {
     let response = next.run(request).await;
 
@@ -1224,10 +1237,15 @@ fn decode_base64_embedding_to_floats(s: &str) -> Result<Vec<f32>, anyhow::Error>
 async fn handler_chat_completions(
     State((state, template)): State<(Arc<service_v2::State>, Option<RequestTemplate>)>,
     headers: HeaderMap,
+    t2_start: Option<axum::Extension<T2Start>>,
     body: Bytes,
 ) -> Result<Response, ErrorResponse> {
     ensure_json_content_type(&headers)?;
     let mut request: NvCreateChatCompletionRequest = parse_json_request("chat completions", &body)?;
+    // RocketKV T2: http = body read + JSON parse (from the middleware's stamp)
+    let t2_http = t2_start.map(|axum::Extension(T2Start(t0, t0_unix))| {
+        (t0, t0_unix, t0.elapsed().as_secs_f64() * 1e3)
+    });
 
     // return a 503 if the service is not ready (process-level + per-model
     // serving readiness). An aggregated request to a decode-only namespace
@@ -1248,6 +1266,10 @@ async fn handler_chat_completions(
 
     // create the context for the request
     let request_id = get_or_create_request_id(&headers);
+    let t2_rid = t2_http.map(|(t0, t0_unix, http)| {
+        crate::t2::begin(&request_id, t0, t0_unix, http);
+        request_id.clone()
+    });
     let streaming = request.inner.stream.unwrap_or(false);
     let resolved_model = resolve_request_model(&request.inner.model, template.as_ref());
     let cancellation_labels = CancellationLabels {
@@ -1279,6 +1301,10 @@ async fn handler_chat_completions(
     // if we got here, then we will return a response and the potentially long running task has completed successfully
     // without need to be cancelled.
     connection_handle.disarm();
+    // RocketKV T2: a request that failed before its stream opened leaves no record behind (no-op after emit)
+    if let Some(rid) = t2_rid {
+        crate::t2::drop_rec(&rid);
+    }
 
     response
 }
@@ -1886,6 +1912,7 @@ async fn chat_completions(
 
     // issue the generate call on the engine
     let stream = engine.generate(request).await.map_err(|e| {
+        crate::t2::drop_rec(&request_id);
         if super::metrics::request_was_rejected(e.as_ref()) {
             state
                 .metrics_clone()
@@ -1895,6 +1922,8 @@ async fn chat_completions(
         inflight_guard.mark_error(extract_error_type_from_response(&err_response));
         err_response
     })?;
+    // RocketKV T2: the worker stream is open (forwarded); one `t2` line
+    crate::t2::emit(&request_id);
 
     // capture the context to cancel the stream if the client disconnects
     let ctx = stream.context();
@@ -2727,6 +2756,7 @@ pub fn chat_completions_router(
     let doc = RouteDoc::new(axum::http::Method::POST, &path);
     let router = Router::new()
         .route(&path, post(handler_chat_completions))
+        .layer(middleware::from_fn(t2_start_middleware))
         .layer(middleware::from_fn(smart_json_error_middleware))
         .layer(axum::extract::DefaultBodyLimit::max(get_body_limit()))
         .with_state((state, template));
