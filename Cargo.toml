@@ -204,4 +204,6 @@ strip = false
 # RocketKV (tok_dynamo.md §4.5): llm-multimodal 1.7.0 vendored in the RocketKV superproject, unmodified except O2 behind its
 # feature `rocketkv-exact-patches` (third-party/llm-multimodal/ROCKETKV.md), which lib/llm turns on
 [patch.crates-io]
+# RocketKV HP (third-party/url/ROCKETKV.md): url 2.5.8 + a fast path for long data: URLs, every Dynamo arm (baseline)
+url = { path = "../url" }
 llm-multimodal = { path = "../llm-multimodal" }

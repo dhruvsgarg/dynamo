@@ -116,4 +116,6 @@ strip = false
 
 # RocketKV (tok_dynamo.md §4.5): as the workspace root's: llm-multimodal with O2 (third-party/llm-multimodal/ROCKETKV.md)
 [patch.crates-io]
+# RocketKV HP (third-party/url/ROCKETKV.md): url 2.5.8 + a fast path for long data: URLs, every Dynamo arm (baseline)
+url = { path = "../../../../url" }
 llm-multimodal = { path = "../../../../llm-multimodal" }
